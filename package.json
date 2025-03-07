@@ -1,0 +1,11 @@
+{
+  "name": "artnetviz",
+  "version": "1.0.0",
+  "description": "A drawing canvas application built with PyQt6 that exposes itself as a Syphon source on macOS. This allows other applications to receive the canvas content in real-time.",
+  "main": "./src/main.py",
+  "scripts": {
+    "start": "python src/main.py"
+  },
+  "author": "",
+  "license": "ISC"
+}
