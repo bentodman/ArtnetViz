@@ -1,0 +1,5 @@
+Collecting numpy
+  Using cached numpy-2.2.3-cp313-cp313-macosx_14_0_arm64.whl.metadata (62 kB)
+Using cached numpy-2.2.3-cp313-cp313-macosx_14_0_arm64.whl (5.1 MB)
+Installing collected packages: numpy
+Successfully installed numpy-2.2.3

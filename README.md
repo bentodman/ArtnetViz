@@ -12,24 +12,16 @@ A PyQt6 application that listens to Art-Net DMX data, visualizes it as pixels on
 - Real-time exposure of the visualization as a Syphon source at 44Hz (standard DMX512 refresh rate)
 - Properly handles port sharing with other Art-Net applications
 - Built-in test pattern generator with various patterns for testing without an external Art-Net source
-- Available as a portable standalone macOS application
 
 ## Requirements
 
 - macOS (required for Syphon)
-- For standalone app: macOS 10.15 or newer
-- For development: Python 3.9+, PyQt6, syphon-python, NumPy, PyYAML
+- Python 3.9 or newer
+- Git (for dependency installation)
 
 ## Installation
 
-### Option 1: Standalone macOS Application (Recommended)
-
-1. Download the latest `ArtNetViz.zip` from the releases page
-2. Extract the ZIP file
-3. Move `ArtNetViz.app` to your Applications folder
-4. Right-click on the app and select "Open" (required only the first time to bypass macOS security)
-
-### Option 2: From Source (Development)
+### Quick Start
 
 1. Clone this repository:
    ```
@@ -37,38 +29,30 @@ A PyQt6 application that listens to Art-Net DMX data, visualizes it as pixels on
    cd ArtnetViz
    ```
 
-2. Create a virtual environment and activate it:
+2. Run the setup script:
    ```
-   python3 -m venv venv
-   source venv/bin/activate
+   ./setup.sh
+   ```
+   
+   This will:
+   - Create a virtual environment
+   - Install all required dependencies
+   - Set up the necessary directories
+   - Verify the installation
+
+3. Run the application:
+   ```
+   ./run.sh
    ```
 
-3. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+### Alternative Setup with npm
 
-4. Install syphon-python from source:
-   ```
-   pip install git+https://github.com/cansik/syphon-python.git
-   ```
+If you have npm installed, you can also use:
 
-5. Run the application:
-   ```
-   ./start.sh
-   ```
-
-## Building the Standalone Application
-
-If you want to build the standalone application yourself:
-
-1. Make sure you have Python 3.9+ and pip installed
-2. Run the build script:
-   ```
-   ./build_app.sh
-   ```
-3. The standalone application will be created in the `dist` folder as `ArtNetViz.app`
-4. A ZIP archive for distribution will also be created at `dist/ArtNetViz.zip`
+```
+npm run setup   # Set up the environment
+npm run run     # Run the application
+```
 
 ## Configuration
 
@@ -189,16 +173,16 @@ visualization:
 
 ## Usage
 
-Run the application using the provided shell script:
+To run the application:
 
 ```
-./start.sh
+./run.sh
 ```
 
 Or with npm:
 
 ```
-npm start
+npm run run
 ```
 
 The application will:

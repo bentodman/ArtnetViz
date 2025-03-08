@@ -4,8 +4,26 @@
   "description": "A visualization application that listens to Art-Net DMX data, visualizes channels as pixels, and exposes itself as a Syphon source on macOS.",
   "main": "./src/main.py",
   "scripts": {
-    "start": "./start.sh"
+    "start": "./start.sh",
+    "run": "./run.sh",
+    "setup": "./setup.sh",
+    "clean": "./clean.sh"
   },
-  "author": "",
-  "license": "ISC"
+  "keywords": [
+    "artnet",
+    "dmx",
+    "syphon",
+    "visualization",
+    "macos",
+    "lighting"
+  ],
+  "author": "ArtNetViz Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/ArtnetViz"
+  },
+  "engines": {
+    "node": ">=12.0.0"
+  }
 }
