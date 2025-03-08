@@ -48,6 +48,9 @@ from artnet_test_source import ArtNetTestSource, PatternType
 # Import our settings dialog
 from settings_dialog import SettingsDialog, load_config_from_file
 
+# Import our DMX recorder dialog
+from dmx_recorder_dialog import DMXRecorderDialog
+
 # Determine if we're running as a standalone app or not
 def get_resource_path(relative_path):
     """Get the correct resource path whether running as script or frozen app"""
@@ -795,27 +798,38 @@ class MainWindow(QMainWindow):
     
     def _create_menus(self):
         """Create the application menus"""
-        # Create menu bar
-        menu_bar = self.menuBar()
+        menubar = self.menuBar()
         
         # File menu
-        file_menu = menu_bar.addMenu("File")
+        file_menu = menubar.addMenu('&File')
         
         # Settings action
-        settings_action = QAction("Advanced Settings", self)
+        settings_action = QAction('&Settings...', self)
+        settings_action.setShortcut('Ctrl+,')
+        settings_action.setStatusTip('Configure application settings')
         settings_action.triggered.connect(self._open_settings)
         file_menu.addAction(settings_action)
         
+        # DMX Recorder action
+        recorder_action = QAction('&DMX Recorder...', self)
+        recorder_action.setShortcut('Ctrl+R')
+        recorder_action.setStatusTip('Open DMX Recorder')
+        recorder_action.triggered.connect(self._open_dmx_recorder)
+        file_menu.addAction(recorder_action)
+        
         # Exit action
-        exit_action = QAction("Exit", self)
+        exit_action = QAction('E&xit', self)
+        exit_action.setShortcut('Ctrl+Q')
+        exit_action.setStatusTip('Exit application')
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         
         # Help menu
-        help_menu = menu_bar.addMenu("Help")
+        help_menu = menubar.addMenu('&Help')
         
         # About action
-        about_action = QAction("About", self)
+        about_action = QAction('&About', self)
+        about_action.setStatusTip('Show About dialog')
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
     
@@ -1012,6 +1026,17 @@ class MainWindow(QMainWindow):
         # when saving to config, but this allows for dynamic testing.
         if hasattr(self.artnet_listener, 'set_universes'):
             self.artnet_listener.set_universes(universes)
+
+    def _open_dmx_recorder(self):
+        """Open the DMX recorder dialog."""
+        # Get DMX recorder settings from config
+        dmx_recorder_config = self.config.get('dmx_recorder', {})
+        recording_dir = dmx_recorder_config.get('recording_dir', 'recordings')
+        
+        # Create and show dialog
+        dialog = DMXRecorderDialog(self.artnet_listener, self)
+        dialog.recorder.recording_dir = recording_dir
+        dialog.exec()
 
 def get_pattern_type_from_string(pattern_str):
     """Convert pattern string from config to PatternType enum"""

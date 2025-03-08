@@ -23,3 +23,7 @@ test_source:
   pattern: SINE_WAVE
   speed: 1.0
 verbose: false
+
+# DMX Recorder settings
+dmx_recorder:
+  recording_dir: recordings

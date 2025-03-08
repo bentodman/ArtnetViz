@@ -71,6 +71,7 @@ build_*/
 dist_*/
 *.log
 .cursor/
+recordings/
 
 # Except specific resource files
 !resources/icons/*.icns 
