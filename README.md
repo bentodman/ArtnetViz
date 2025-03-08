@@ -4,7 +4,7 @@ A PyQt6 application that listens to Art-Net DMX data, visualizes it as pixels on
 
 ## Features
 
-- Listens to multiple Art-Net universes defined in a configuration file
+- Listens to multiple Art-Net universes configurable directly in the UI
 - Visualizes each DMX channel as a pixel (value 0-255 mapped from black to white)
 - Each universe occupies one row of 512 pixels (one pixel per DMX channel)
 - Configurable pixel size and spacing for better visibility
@@ -12,6 +12,8 @@ A PyQt6 application that listens to Art-Net DMX data, visualizes it as pixels on
 - Real-time exposure of the visualization as a Syphon source at 44Hz (standard DMX512 refresh rate)
 - Properly handles port sharing with other Art-Net applications
 - Built-in test pattern generator with various patterns for testing without an external Art-Net source
+- All settings configurable through an intuitive user interface
+- Persistent window size and position between sessions
 
 ## Requirements
 
@@ -25,7 +27,7 @@ A PyQt6 application that listens to Art-Net DMX data, visualizes it as pixels on
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/ArtnetViz.git
+   git clone https://github.com/bentodman/ArtnetViz.git
    cd ArtnetViz
    ```
 
@@ -54,9 +56,45 @@ npm run setup   # Set up the environment
 npm run run     # Run the application
 ```
 
+## User Interface
+
+The application features an intuitive user interface with the following components:
+
+### Main Window
+
+The main window consists of:
+
+1. **Canvas Area**: The top portion displays the DMX data visualization with each universe as a row of pixels, each pixel representing one DMX channel value.
+
+2. **Control Panel**: The bottom section contains intuitive controls organized into logical groups:
+   - **Visualization Settings**: Controls for pixel size, gaps, starting position, canvas dimensions, and frame rate
+   - **Art-Net Settings**: Universe management tools to add/remove monitored universes
+   - **Save Settings**: Saves your current configuration to the `config.yaml` file
+
+3. **Menu Bar**: Provides access to:
+   - **File**: Exit the application
+   - **Settings**: Open advanced settings dialog for Art-Net network configuration and test pattern settings
+   - **Help**: About dialog and documentation
+
+### Direct Universe Management
+
+You can directly manage which universes you want to monitor:
+
+1. The universe list displays all currently monitored universes
+2. Use the numeric spinner and "Add" button to add a new universe 
+3. Select one or more universes and click "Remove" to stop monitoring them
+4. Changes take effect immediately for real-time testing
+
+### Advanced Settings Dialog
+
+The Settings dialog allows configuration of Art-Net network settings and test pattern generation:
+
+- **Art-Net Settings**: Configure IP address, port, and universes
+- **Test Source Settings**: Enable/disable test pattern generator, select pattern type, and adjust animation speed
+
 ## Configuration
 
-The application uses a YAML configuration file (`config.yaml`) to specify Art-Net and visualization settings. The file should be placed in the root directory of the project.
+While most settings can be adjusted directly through the user interface, the application also uses a YAML configuration file (`config.yaml`) for persistence. This file is automatically created or updated when you click "Save Settings to Config" in the UI.
 
 Example configuration:
 
@@ -82,22 +120,15 @@ test_source:
   # Animation speed multiplier
   speed: 1.0
 
-# Visualization Configuration
-visualization:
-  # Size of each pixel (width and height in screen pixels)
-  pixel_size: 1
-  # Horizontal gap between pixels (in screen pixels)
-  gap_x: 0
-  # Vertical gap between pixels (in screen pixels)
-  gap_y: 0
-  # Overall canvas width (0 = auto-size based on content)
-  canvas_width: 0
-  # Overall canvas height (0 = auto-size based on content)
-  canvas_height: 0
-  # X position of visualization from top-left of canvas
-  start_x: 0
-  # Y position of visualization from top-left of canvas
-  start_y: 0
+# Visualization Settings
+pixel_size: 1
+gap_x: 0
+gap_y: 0
+canvas_width: 0
+canvas_height: 0
+start_x: 0
+start_y: 0
+frame_rate: 44
 ```
 
 ### Configuration Options
@@ -128,129 +159,29 @@ visualization:
 - `canvas_height`: Overall height of the canvas in pixels (0 = auto-size based on content + start_y)
 - `start_x`: X position of visualization from top-left of canvas (default: 0)
 - `start_y`: Y position of visualization from top-left of canvas (default: 0)
+- `frame_rate`: Update rate for the visualization (default: 44, which is the DMX standard)
 
-#### Example Configurations:
+## Common Use Cases
 
-**Basic View (Default)**
-```yaml
-visualization:
-  pixel_size: 1
-  gap_x: 0
-  gap_y: 0
-  canvas_width: 0
-  canvas_height: 0
-  start_x: 0
-  start_y: 0
-```
+### Basic Setup for DMX Monitoring
 
-**Spaced Grid**
-```yaml
-visualization:
-  pixel_size: 3
-  gap_x: 1
-  gap_y: 1
-```
+1. **Launch the application** using `./run.sh`
+2. **Set which universes to monitor** using the Universe control panel
+3. **Adjust visualization settings** as needed:
+   - Increase `Pixel Size` for better visibility
+   - Add `H-Gap` or `V-Gap` to create spacing between pixels/universes
+4. **Save your settings** by clicking "Save Settings to Config"
 
-**Fixed Canvas with Centered Visualization**
-```yaml
-visualization:
-  pixel_size: 2
-  gap_x: 0
-  gap_y: 0
-  canvas_width: 1024
-  canvas_height: 768
-  start_x: 100
-  start_y: 50
-```
+** to apply the settings and restart the application when prompted
 
-**Multiple Universe Display with Row Spacing**
-```yaml
-visualization:
-  pixel_size: 2
-  gap_x: 0
-  gap_y: 10
-```
+### Integrating with Syphon-compatible Applications
 
-## Usage
+1. Configure ArtNetViz to visualize your desired universes
+2. Launch a Syphon-compatible application (e.g., VDMX, MadMapper, OBS with Syphon plugin)
+3. In the receiving application, select "ArtNet Visualizer" as the Syphon source
+4. The DMX visualization will appear in real-time in the receiving application
 
-To run the application:
-
-```
-./run.sh
-```
-
-Or with npm:
-
-```
-npm run run
-```
-
-The application will:
-1. Read the configuration file to determine which Art-Net universes to listen to and how to visualize them
-2. Create a canvas with the specified dimensions (or auto-sized based on content)
-3. Position the visualization within the canvas according to the configuration
-4. Listen for incoming Art-Net DMX data on the specified universes
-5. Visualize each DMX channel as a pixel with its brightness corresponding to the channel value (0-255)
-6. Publish the visualization as a Syphon source named "ArtNet Visualizer", which can be accessed by other Syphon-compatible applications
-
-## Port Sharing
-
-The application uses socket options `SO_REUSEADDR` and `SO_REUSEPORT` (if available) to properly handle port sharing with other Art-Net applications. This allows the visualizer to receive Art-Net data even when other lighting control software is already using the standard Art-Net port (6454).
-
-## Using the Test Pattern Generator
-
-The application includes a built-in test pattern generator that can generate various Art-Net DMX patterns without requiring an external Art-Net controller. This is useful for:
-
-1. Testing Syphon integration with other applications
-2. Developing and debugging the visualizer
-3. Demonstrating the application without external hardware
-4. Creating interesting visual patterns for creative purposes
-
-To enable the test pattern generator:
-
-1. Open the `config.yaml` file
-2. Set `test_source.enabled` to `true`
-3. Choose a pattern type from the available options
-4. Optionally adjust the animation speed
-
-Example test source configuration:
-
-```yaml
-# Test Source Configuration
-test_source:
-  # Enable test source instead of Art-Net listener
-  enabled: true
-  # Pattern type to generate
-  pattern: "SINE_WAVE"
-  # Animation speed multiplier
-  speed: 0.5
-```
-
-When test source is enabled, the application will generate the specified pattern at the standard Art-Net refresh rate (44Hz) instead of listening for external Art-Net data.
-
-## How It Works
-
-The application uses:
-
-1. **Custom Art-Net listener** to receive incoming Art-Net data with proper port sharing
-2. **PyQt6** for the GUI and canvas display
-3. **syphon-python** to expose the canvas as a Syphon source
-4. **Metal** (via syphon-python) for GPU-accelerated texture sharing
-
-The application:
-1. Creates an Art-Net listener that binds to the specified port with proper socket options
-2. Updates the canvas at 44Hz (standard DMX512 refresh rate)
-3. Renders each DMX channel as a grayscale pixel in a row for each universe, with size and spacing based on the configuration
-4. Converts the canvas to a NumPy array
-5. Copies the array data to a Metal texture
-6. Publishes the texture to Syphon
 
 ## License
 
 MIT
-
-## Acknowledgements
-
-- [syphon-python](https://github.com/cansik/syphon-python) by cansik
-- [Syphon Framework](https://github.com/Syphon/Syphon-Framework)
-- [PyQt](https://www.riverbankcomputing.com/software/pyqt/) 

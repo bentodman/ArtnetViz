@@ -157,4 +157,33 @@ class ArtNetListener:
     
     def is_running(self):
         """Check if the listener is running."""
-        return self.running 
+        return self.running
+        
+    def set_universes(self, universes):
+        """Set the universes to listen to, updating buffers as necessary.
+        
+        Args:
+            universes (list): List of universe IDs to monitor
+        """
+        if not universes:
+            universes = [0]  # Default to universe 0 if empty
+            
+        universes = sorted(universes)
+        
+        # Check if anything changed
+        if self.universes == universes:
+            return False
+            
+        # Remove buffers for universes that are no longer needed
+        for universe in list(self.buffers.keys()):
+            if universe not in universes:
+                del self.buffers[universe]
+                
+        # Add buffers for new universes
+        for universe in universes:
+            if universe not in self.buffers:
+                self.buffers[universe] = np.zeros(512, dtype=np.uint8)
+                
+        # Update the universe list
+        self.universes = universes
+        return True 

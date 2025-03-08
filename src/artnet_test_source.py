@@ -63,6 +63,35 @@ class ArtNetTestSource:
         """Set the frames per second for pattern updates"""
         self.fps = fps
     
+    def set_universes(self, universes):
+        """Set the universes to generate, updating buffers as necessary.
+        
+        Args:
+            universes (list): List of universe IDs to generate
+        """
+        if not universes:
+            universes = [0]  # Default to universe 0 if empty
+            
+        universes = sorted(universes)
+        
+        # Check if anything changed
+        if self.universes == universes:
+            return False
+            
+        # Remove buffers for universes that are no longer needed
+        for universe in list(self.buffers.keys()):
+            if universe not in universes:
+                del self.buffers[universe]
+                
+        # Add buffers for new universes
+        for universe in universes:
+            if universe not in self.buffers:
+                self.buffers[universe] = np.zeros(512, dtype=np.uint8)
+                
+        # Update the universe list
+        self.universes = universes
+        return True
+    
     def _pattern_thread(self):
         """Thread function that generates the test patterns"""
         interval = 1.0 / self.fps

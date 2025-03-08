@@ -63,53 +63,6 @@ if [ "$MISSING_DEPS" = true ]; then
     exit 1
 fi
 
-# Check for config file
-if [ ! -f "config.yaml" ]; then
-    echo -e "${RED}Config file (config.yaml) not found.${NC}"
-    echo -e "${YELLOW}Creating a default config file...${NC}"
-    
-    cat > config.yaml << EOF
-# Art-Net Configuration
-artnet:
-  # IP address to bind to (0.0.0.0 for all interfaces)
-  host: "0.0.0.0"
-  # Port (standard Art-Net port is 6454)
-  port: 6454
-  # List of universes to listen to
-  universes:
-    - 0  # Universe 0
-    - 1  # Universe 1
-
-# Test Source Configuration
-test_source:
-  # Enable test source instead of Art-Net listener
-  enabled: true
-  # Pattern type to generate
-  pattern: "MOVING_BAR_H"
-  # Animation speed multiplier
-  speed: 1.0
-
-# Visualization Configuration
-visualization:
-  # Size of each pixel (width and height in screen pixels)
-  pixel_size: 2
-  # Horizontal gap between pixels (in screen pixels)
-  gap_x: 0
-  # Vertical gap between pixels (in screen pixels)
-  gap_y: 1
-  # Overall canvas width (0 = auto-size based on content)
-  canvas_width: 0
-  # Overall canvas height (0 = auto-size based on content)
-  canvas_height: 0
-  # X position of visualization from top-left of canvas
-  start_x: 0
-  # Y position of visualization from top-left of canvas
-  start_y: 0
-EOF
-    
-    echo -e "${GREEN}Default config file created.${NC}"
-fi
-
 # Print informational message
 echo -e "${GREEN}Starting Art-Net Visualizer...${NC}"
 echo -e "${YELLOW}Note: If you see 'Address already in use' errors, this is normal when other Art-Net applications are running.${NC}"
@@ -135,7 +88,9 @@ if [ $EXIT_CODE -ne 0 ]; then
     echo -e "${YELLOW}1. Run the setup script again: ./setup.sh${NC}"
     echo -e "${YELLOW}2. Check for dependency conflicts: source venv/bin/activate && pip check${NC}"
     echo -e "${YELLOW}3. Make sure all required hardware is connected${NC}"
-    echo -e "${YELLOW}4. Try enabling the test mode in config.yaml (set test_source.enabled to true)${NC}"
+    echo -e "${YELLOW}4. Configure Art-Net parameters through the application UI${NC}"
+    echo -e "${YELLOW}   - Universe selection directly in the main window${NC}"
+    echo -e "${YELLOW}   - Network settings via Settings > Settings menu${NC}"
 else
     echo -e "${GREEN}Application exited successfully.${NC}"
 fi
