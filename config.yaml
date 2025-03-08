@@ -1,0 +1,52 @@
+# Art-Net Configuration
+artnet:
+  # IP address to bind to (0.0.0.0 for all interfaces)
+  host: "0.0.0.0"
+  # Port (standard Art-Net port is 6454)
+  port: 6454
+  # List of universes to listen to
+  universes:
+    # Format: universe_id (0-15)
+    - 0  # Universe 0
+    - 1  # Universe 1
+    - 2  # Universe 2
+    - 3  # Universe 3
+    - 4  # Universe 4
+    - 5  # Universe 5
+    - 6  # Universe 6
+    - 7  # Universe 7
+    # Add more universes as needed 
+
+# Test Source Configuration
+test_source:
+  # Enable test source instead of Art-Net listener
+  enabled: false
+  # Pattern type to generate:
+  # GRADIENT_H: Horizontal gradient
+  # GRADIENT_V: Vertical gradient
+  # CHECKERBOARD: Checkerboard pattern
+  # MOVING_BAR_H: Horizontal moving bar
+  # MOVING_BAR_V: Vertical moving bar
+  # PULSE: Pulsing brightness
+  # RANDOM: Random noise
+  # SINE_WAVE: Sine wave
+  pattern: "RANDOM"
+  # Animation speed multiplier
+  speed: 1.0
+
+# Visualization Configuration
+visualization:
+  # Size of each pixel (width and height in screen pixels)
+  pixel_size: 3
+  # Horizontal gap between pixels (in screen pixels)
+  gap_x: 0
+  # Vertical gap between pixels (in screen pixels)
+  gap_y: 1
+  # Overall canvas width (0 = auto-size based on content)
+  canvas_width: 1536
+  # Overall canvas height (0 = auto-size based on content)
+  canvas_height: 32
+  # X position of visualization from top-left of canvas
+  start_x: 0
+  # Y position of visualization from top-left of canvas
+  start_y: 0 

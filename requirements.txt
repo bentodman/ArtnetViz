@@ -1,4 +1,6 @@
-PyQt6>=6.8.0
-numpy>=2.2.0
-pyobjc>=10.0.0
-# Note: syphon-python must be installed from source, see README.md 
+PyQt6>=6.4.0
+numpy>=1.23.0
+pyobjc>=9.0.1
+PyYAML>=6.0
+# syphon-python must be installed from source:
+# pip install git+https://github.com/cansik/syphon-python.git 
