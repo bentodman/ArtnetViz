@@ -794,9 +794,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error Saving Settings", f"Could not save configuration: {e}")
     
     def _create_menus(self):
-        """Create the application menu bar"""
-        menu_bar = QMenuBar()
-        self.setMenuBar(menu_bar)
+        """Create the application menus"""
+        # Create menu bar
+        menu_bar = self.menuBar()
         
         # File menu
         file_menu = menu_bar.addMenu("File")
@@ -820,7 +820,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
     
     def _open_settings(self):
-        """Open the settings dialog for advanced settings"""
+        """Open the advanced settings dialog for network and test source settings"""
         # Create settings dialog with current config
         dialog = SettingsDialog(config=self.config, parent=self)
         
@@ -829,13 +829,18 @@ class MainWindow(QMainWindow):
             # Get the new config
             new_config = dialog.get_config()
             
+            # Preserve universes from current config
+            current_universes = self.config.get('artnet', {}).get('universes', [])
+            if 'artnet' in new_config:
+                new_config['artnet']['universes'] = current_universes
+            
             # Check if we need to restart the data source
             restart_needed = self._check_restart_needed(new_config)
             
             # Update the config
             self.config = new_config
             
-            # Update UI controls to match new settings
+            # Update UI controls to match new settings (if any are still in both places)
             self._update_control_values()
             
             if restart_needed:
@@ -843,11 +848,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "Restart Required",
-                    "Some settings require restarting the application to take effect."
+                    "The changes you made require restarting the application to take effect."
                 )
-            else:
-                # Apply visualization changes that don't need restart
-                self._apply_viz_settings()
     
     def _update_control_values(self):
         """Update control values based on current configuration without triggering change events"""

@@ -11,7 +11,7 @@ artnet:
   - 6
   - 7
 canvas_height: 0
-canvas_width: 2048
+canvas_width: 0
 frame_rate: 50
 gap_x: 0
 gap_y: 0
@@ -20,6 +20,6 @@ start_x: 0
 start_y: 0
 test_source:
   enabled: false
-  pattern: MOVING_BAR_H
+  pattern: SINE_WAVE
   speed: 1.0
 verbose: false

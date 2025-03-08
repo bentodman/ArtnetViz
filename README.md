@@ -87,10 +87,12 @@ You can directly manage which universes you want to monitor:
 
 ### Advanced Settings Dialog
 
-The Settings dialog allows configuration of Art-Net network settings and test pattern generation:
+The Advanced Settings dialog provides configuration options for settings that require a restart to take effect:
 
-- **Art-Net Settings**: Configure IP address, port, and universes
-- **Test Source Settings**: Enable/disable test pattern generator, select pattern type, and adjust animation speed
+- **ArtNet Network**: Configure the IP address and port for the Art-Net listener
+- **Test Source**: Enable/disable test pattern generator, select pattern type, and adjust animation speed
+
+These settings are separated into their own dialog since they require restarting the application to take effect, unlike the visualization settings that can be adjusted in real-time from the main window.
 
 ## Configuration
 
@@ -173,6 +175,15 @@ frame_rate: 44
 4. **Save your settings** by clicking "Save Settings to Config"
 
 ** to apply the settings and restart the application when prompted
+
+### Testing with Built-in Patterns
+
+1. Open the **File** menu and select **Advanced Settings**
+2. In the dialog that appears, go to the **Test Source** tab
+3. **Enable** the test source
+4. Select a **Pattern** from the dropdown menu
+5. Adjust the **Speed** as desired
+6. Click **Save** to apply the settings and restart the application when prompted
 
 ### Integrating with Syphon-compatible Applications
 
