@@ -206,4 +206,100 @@ echo -e "${BLUE}=========================================${NC}"
 echo -e "${YELLOW}Note: If you encounter any dependency conflicts when running the application,${NC}"
 echo -e "${YELLOW}you may need to modify the requirements.txt file and rerun this setup script.${NC}"
 echo -e "${YELLOW}Alternatively, you can try running:${NC}"
-echo -e "${YELLOW}source venv/bin/activate && pip install <specific-package-version> && deactivate${NC}" 
+echo -e "${YELLOW}source venv/bin/activate && pip install <specific-package-version> && deactivate${NC}"
+
+# Function to print colored output
+print_status() {
+    if [ $? -eq 0 ]; then
+        echo -e "\033[32m✓ $1\033[0m"  # Green
+    else
+        echo -e "\033[31m✗ $1\033[0m"  # Red
+        exit 1
+    fi
+}
+
+# Check if we're in the right directory
+if [ ! -f "setup.sh" ]; then
+    echo "Please run this script from the project root directory"
+    exit 1
+fi
+
+echo "Setting up ArtNet Visualizer..."
+
+# Create virtual environment if it doesn't exist
+if [ ! -d "venv" ]; then
+    echo "Creating virtual environment..."
+    python3 -m venv venv
+    print_status "Virtual environment created"
+fi
+
+# Activate virtual environment
+echo "Activating virtual environment..."
+source venv/bin/activate
+print_status "Virtual environment activated"
+
+# Install/upgrade pip
+echo "Upgrading pip..."
+python -m pip install --upgrade pip
+print_status "Pip upgraded"
+
+# Install requirements
+echo "Installing requirements..."
+pip install -r requirements.txt
+print_status "Requirements installed"
+
+# Install syphon-python
+echo "Installing syphon-python..."
+
+# Check if we have a pre-built wheel
+if [ -d "dist" ] && [ "$(ls -A dist/*.whl 2>/dev/null)" ]; then
+    echo "Found pre-built wheel, installing..."
+    pip install dist/*.whl
+    print_status "syphon-python installed from wheel"
+else
+    # No wheel available, try to build from source
+    echo "No pre-built wheel found, attempting to build from source..."
+    
+    # Check if we have Xcode Command Line Tools
+    if ! xcode-select -p &>/dev/null; then
+        echo -e "\033[31mError: Xcode Command Line Tools not found\033[0m"
+        echo "To install Xcode Command Line Tools, run: xcode-select --install"
+        echo "Or download a pre-built version of this application."
+        exit 1
+    fi
+    
+    # Initialize Syphon submodules if needed
+    if [ ! -d "syphon-python/vendor/Syphon/Syphon.xcodeproj" ]; then
+        echo "Initializing Syphon submodules..."
+        (cd syphon-python && git submodule init && git submodule update)
+        print_status "Syphon submodules initialized"
+    fi
+    
+    # Install from source
+    pip install -e syphon-python
+    print_status "syphon-python installed from source"
+fi
+
+# Check for outdated packages
+echo "Checking for outdated packages..."
+pip list --outdated
+print_status "Package check completed"
+
+# Create resources directories if they don't exist
+echo "Checking resources directories..."
+mkdir -p resources/icons
+print_status "Resources directories created/verified"
+
+# Verify dependencies
+echo "Verifying dependencies..."
+python -c "import syphon" 2>/dev/null
+if [ $? -eq 0 ]; then
+    print_status "Package 'syphon' is installed correctly"
+else
+    echo -e "\033[31m✗ Package 'syphon' is not installed correctly\033[0m"
+    echo "Some dependencies are missing or not installed correctly."
+    echo "Please check the error messages above."
+    exit 1
+fi
+
+echo -e "\033[32m✓ Setup completed successfully\033[0m" 
