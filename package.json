@@ -4,7 +4,6 @@
   "description": "A visualization application that listens to Art-Net DMX data, visualizes channels as pixels, and exposes itself as a Syphon source on macOS.",
   "main": "./src/main.py",
   "scripts": {
-    "start": "./start.sh",
     "run": "./run.sh",
     "setup": "./setup.sh",
     "clean": "./clean.sh"

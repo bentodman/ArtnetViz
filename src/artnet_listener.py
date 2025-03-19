@@ -8,6 +8,8 @@ import threading
 import time
 import numpy as np
 import struct
+import psutil
+import tracemalloc
 
 class ArtNetPacket:
     """
@@ -50,6 +52,12 @@ class ArtNetListener:
         self.thread = None
         self.socket = None
         self.buffers = {}
+        self._dmx_data_buffer = np.zeros(512, dtype=np.uint8)  # Reusable buffer for DMX data
+        
+        # Memory tracking
+        self._packet_counter = 0
+        self._last_memory_check = 0
+        self._memory_check_interval = 1000  # Check memory every 1000 packets
         
         # Initialize a buffer for each universe with zeros
         for universe in self.universes:
@@ -121,8 +129,26 @@ class ArtNetListener:
             # Extract the DMX data
             dmx_data = data[18:18+length]
             
-            # Convert to numpy array and update buffer
-            self.buffers[universe] = np.frombuffer(dmx_data, dtype=np.uint8)
+            # Use the reusable buffer to avoid creating new arrays
+            if length <= len(self._dmx_data_buffer):
+                np.copyto(self._dmx_data_buffer[:length], np.frombuffer(dmx_data, dtype=np.uint8))
+                np.copyto(self.buffers[universe], self._dmx_data_buffer)
+        
+        # Increment packet counter and check memory usage periodically
+        self._packet_counter += 1
+        if self._packet_counter % self._memory_check_interval == 0:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / (1024 * 1024)
+            print(f"ArtNetListener memory usage at packet {self._packet_counter}: {memory_mb:.2f} MB")
+            
+            # Take a memory snapshot if tracemalloc is enabled
+            if tracemalloc.is_tracing():
+                snapshot = tracemalloc.take_snapshot()
+                top_stats = snapshot.statistics('lineno')
+                print("\nTop memory allocations in ArtNetListener:")
+                for stat in top_stats[:5]:
+                    print(f"{stat}")
     
     def start(self):
         """Start listening for Art-Net data."""
@@ -143,8 +169,13 @@ class ArtNetListener:
             if self.socket:
                 # Close the socket to unblock the recvfrom call
                 self.socket.close()
-            self.thread.join(timeout=1.0)
+                self.socket = None
+            self.thread.join(timeout=1.0)  # Wait for thread to finish
             self.thread = None
+        
+        # Clear buffers
+        self.buffers.clear()
+        self._dmx_data_buffer = None
         print("Art-Net listener stopped")
     
     def get_buffer(self, universe):

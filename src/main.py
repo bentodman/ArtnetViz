@@ -31,6 +31,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPainter, QColor, QPixmap, QAction
 from PyQt6.QtCore import Qt, QTimer, QRect, QByteArray, QSize, QSettings
+import gc
+import psutil
+import tracemalloc
 
 import syphon
 from syphon.utils.numpy import copy_image_to_mtl_texture
@@ -48,8 +51,15 @@ from artnet_test_source import ArtNetTestSource, PatternType
 # Import our settings dialog
 from settings_dialog import SettingsDialog, load_config_from_file
 
-# Import our DMX recorder dialog
-from dmx_recorder_dialog import DMXRecorderDialog
+# Import memory tracking utilities
+try:
+    from debug_objects import memory_tracker, setup_memory_tracking, memory_snapshot
+    MEMORY_TRACKING_AVAILABLE = True
+except ImportError:
+    MEMORY_TRACKING_AVAILABLE = False
+    
+# Global flag for enabling additional memory debugging
+DEBUG_MEMORY = False
 
 # Determine if we're running as a standalone app or not
 def get_resource_path(relative_path):
@@ -94,6 +104,10 @@ class CanvasWidget(QWidget):
         # Frame rate control
         self.frame_rate = 44  # Default to DMX standard ~44Hz
         
+        # Memory tracking
+        self._last_memory_check = 0
+        self._memory_check_interval = 10  # Check memory every 10 frames
+        
         # Initialize Syphon
         self.init_syphon()
         
@@ -114,6 +128,14 @@ class CanvasWidget(QWidget):
         self.full_res_pixmap = None  # Full-resolution pixmap for Syphon output
         self.max_preview_width = 1200  # Maximum width for the preview window
         self.max_preview_height = 800  # Maximum height for the preview window
+        
+        # Initialize painters
+        self._painter = None
+        self._full_res_painter = None
+        
+        # Frame counter for periodic cleanup
+        self._frame_counter = 0
+        
         self.update_canvas()
 
     def init_syphon(self):
@@ -164,7 +186,7 @@ class CanvasWidget(QWidget):
     def update_canvas(self):
         """Update the canvas with the current Art-Net DMX data"""
         # Get DMX data for all universes
-        universes = self.artnet_listener.universes  # Use the universes property directly
+        universes = self.artnet_listener.universes
         universe_count = len(universes)
         
         if self.verbose:
@@ -172,18 +194,17 @@ class CanvasWidget(QWidget):
         
         if universe_count > 0:
             # Calculate canvas dimensions based on visualization parameters
-            # Each universe is 512 DMX channels, represented as a row of pixels
             dmx_width = 512
             
             # Calculate pixel dimensions including gaps
             pixel_width_with_gap = self.pixel_size + self.gap_x
             pixel_height_with_gap = self.pixel_size + self.gap_y
             
-            # Calculate content dimensions (area needed for the DMX visualization)
+            # Calculate content dimensions
             content_width = dmx_width * pixel_width_with_gap
             content_height = universe_count * pixel_height_with_gap
             
-            # Determine canvas dimensions (considering custom size if specified)
+            # Determine canvas dimensions
             canvas_width = max(self.custom_canvas_width, content_width + self.start_x) if self.custom_canvas_width > 0 else content_width + self.start_x
             canvas_height = max(self.custom_canvas_height, content_height + self.start_y) if self.custom_canvas_height > 0 else content_height + self.start_y
             
@@ -192,21 +213,22 @@ class CanvasWidget(QWidget):
             
             # Create or resize the full resolution pixmap for Syphon output
             if self.full_res_pixmap is None or self.full_res_pixmap.width() != canvas_width or self.full_res_pixmap.height() != canvas_height:
+                if self.full_res_pixmap is not None:
+                    del self.full_res_pixmap
+                    gc.collect()
+                
                 self.full_res_pixmap = QPixmap(canvas_width, canvas_height)
                 print(f"Created new full-res pixmap: {canvas_width}x{canvas_height}")
             
-            # Check if we need to resize the preview pixmap (limit to max dimensions)
+            # Check if we need to resize the preview pixmap
             preview_width = canvas_width
             preview_height = canvas_height
             
-            # Check if dimensions exceed maximum preview size
             if preview_width > self.max_preview_width or preview_height > self.max_preview_height:
-                # Calculate scale factor to fit within max dimensions while preserving aspect ratio
                 width_ratio = self.max_preview_width / preview_width
                 height_ratio = self.max_preview_height / preview_height
                 scale_factor = min(width_ratio, height_ratio)
                 
-                # Scale dimensions for preview
                 preview_width = int(preview_width * scale_factor)
                 preview_height = int(preview_height * scale_factor)
                 if self.verbose:
@@ -214,78 +236,79 @@ class CanvasWidget(QWidget):
             
             # Create or resize the preview pixmap as needed
             if self.pixmap is None or self.pixmap.width() != preview_width or self.pixmap.height() != preview_height:
-                self.pixmap = QPixmap(preview_width, preview_height)
-                if self.verbose:
-                    print(f"Created new preview pixmap: {preview_width}x{preview_height}")
-                self.update()  # Trigger a repaint
-            
-            # Clear both pixmaps with black background
-            self.full_res_pixmap.fill(Qt.GlobalColor.black)
-            self.pixmap.fill(Qt.GlobalColor.black)
-            
-            # Create painters for both pixmaps
-            full_res_painter = QPainter(self.full_res_pixmap)
-            preview_painter = QPainter(self.pixmap)
-            
-            # Calculate scaling ratio for preview if needed
-            preview_scale = 1.0
-            if preview_width < canvas_width:
-                preview_scale = preview_width / canvas_width
-            
-            # For each universe, draw its DMX values as pixels
-            for u_idx, universe in enumerate(universes):
-                # Get the DMX data for this universe (512 channels)
-                universe_data = self.artnet_listener.get_buffer(universe)
+                if self.pixmap is not None:
+                    del self.pixmap
+                    gc.collect()
                 
-                if universe_data is not None:
-                    if self.verbose:
-                        print(f"Drawing universe {universe}, data shape: {universe_data.shape}")
-                    # For each DMX channel, draw a pixel with brightness based on value
-                    for ch_idx, value in enumerate(universe_data):
-                        if ch_idx < 512:  # Ensure we don't exceed DMX channel range
-                            # Calculate full-res pixel position
-                            x = self.start_x + ch_idx * pixel_width_with_gap
-                            y = self.start_y + u_idx * pixel_height_with_gap
-                            
-                            # Set pixel color based on DMX value (0-255)
-                            # White with varying brightness
-                            color = QColor(value, value, value)
-                            
-                            # Draw the pixel on full-res pixmap
-                            full_res_painter.fillRect(
-                                x, y, self.pixel_size, self.pixel_size, color
-                            )
-                            
-                            # Draw on preview pixmap (with scaling if needed)
-                            if preview_scale < 1.0:
-                                # Scale coordinates and size for preview
-                                preview_x = int(x * preview_scale)
-                                preview_y = int(y * preview_scale)
-                                preview_pixel_size = max(1, int(self.pixel_size * preview_scale))
-                                
-                                # Draw scaled pixel on preview
-                                preview_painter.fillRect(
-                                    preview_x, preview_y, preview_pixel_size, preview_pixel_size, color
-                                )
-                            else:
-                                # Same as full-res if no scaling needed
-                                preview_painter.fillRect(
-                                    x, y, self.pixel_size, self.pixel_size, color
-                                )
-                elif self.verbose:
-                    print(f"No data for universe {universe}")
+                self.pixmap = QPixmap(preview_width, preview_height)
             
-            # End painting on both pixmaps
-            full_res_painter.end()
-            preview_painter.end()
+            # Clear both pixmaps
+            self.full_res_pixmap.fill(Qt.GlobalColor.transparent)
+            self.pixmap.fill(Qt.GlobalColor.transparent)
             
-            # Update the Syphon server with full-res content
-            if self.verbose:
-                print("Updating Syphon frame")
+            # Create new painters for each frame
+            self._full_res_painter = QPainter(self.full_res_pixmap)
+            self._painter = QPainter(self.pixmap)
+            
+            # Draw DMX data
+            for i, universe in enumerate(universes):
+                dmx_data = self.artnet_listener.get_buffer(universe)
+                if dmx_data is None:
+                    continue
+                
+                # Calculate row position
+                row_y = self.start_y + (i * pixel_height_with_gap)
+                
+                # Draw each DMX channel as a pixel
+                for j in range(min(len(dmx_data), 512)):
+                    # Calculate pixel position
+                    pixel_x = self.start_x + (j * pixel_width_with_gap)
+                    
+                    # Get DMX value (0-255)
+                    value = dmx_data[j]
+                    
+                    # Create color based on DMX value
+                    color = QColor(value, value, value)
+                    
+                    # Draw on both pixmaps
+                    self._full_res_painter.fillRect(pixel_x, row_y, self.pixel_size, self.pixel_size, color)
+                    
+                    # Scale preview coordinates
+                    preview_x = int(pixel_x * (preview_width / canvas_width))
+                    preview_y = int(row_y * (preview_height / canvas_height))
+                    preview_size = int(self.pixel_size * (preview_width / canvas_width))
+                    
+                    self._painter.fillRect(preview_x, preview_y, preview_size, preview_size, color)
+            
+            # End painters
+            self._full_res_painter.end()
+            self._painter.end()
+            
+            # Update Syphon frame
             self.update_syphon_frame()
             
-            # Trigger a repaint of the widget
+            # Force update of the widget
             self.update()
+            
+            # Periodic cleanup and memory check
+            self._frame_counter += 1
+            if self._frame_counter % 10 == 0:
+                gc.collect()
+                
+                # Check memory usage periodically
+                if self._frame_counter % self._memory_check_interval == 0:
+                    process = psutil.Process()
+                    memory_info = process.memory_info()
+                    memory_mb = memory_info.rss / (1024 * 1024)
+                    print(f"Memory usage at frame {self._frame_counter}: {memory_mb:.2f} MB")
+                    
+                    # Take a memory snapshot if tracemalloc is enabled
+                    if tracemalloc.is_tracing():
+                        snapshot = tracemalloc.take_snapshot()
+                        top_stats = snapshot.statistics('lineno')
+                        print("\nTop memory allocations:")
+                        for stat in top_stats[:5]:
+                            print(f"{stat}")
         elif self.verbose:
             print("No universes found. Canvas not updated.")
     
@@ -405,6 +428,34 @@ class CanvasWidget(QWidget):
         if self.update_timer:
             self.update_timer.stop()
         
+        # Clean up painters
+        if self._painter is not None:
+            try:
+                self._painter.end()
+            except:
+                pass
+            del self._painter
+        
+        if self._full_res_painter is not None:
+            try:
+                self._full_res_painter.end()
+            except:
+                pass
+            del self._full_res_painter
+        
+        # Clean up pixmaps
+        if hasattr(self, '_full_res_pixmap'):
+            del self._full_res_pixmap
+        
+        if hasattr(self, 'full_res_pixmap'):
+            del self.full_res_pixmap
+        
+        if hasattr(self, 'pixmap'):
+            del self.pixmap
+        
+        # Force a garbage collection
+        gc.collect()
+        
         if self.server:
             try:
                 if hasattr(self.server, 'stop'):
@@ -412,6 +463,10 @@ class CanvasWidget(QWidget):
                 print("Syphon server stopped")
             except Exception as e:
                 print(f"Error stopping Syphon server: {e}")
+
+    def __del__(self):
+        """Clean up resources when object is deleted"""
+        self.cleanup()
 
 class MainWindow(QMainWindow):
     """
@@ -810,13 +865,6 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self._open_settings)
         file_menu.addAction(settings_action)
         
-        # DMX Recorder action
-        recorder_action = QAction('&DMX Recorder...', self)
-        recorder_action.setShortcut('Ctrl+R')
-        recorder_action.setStatusTip('Open DMX Recorder')
-        recorder_action.triggered.connect(self._open_dmx_recorder)
-        file_menu.addAction(recorder_action)
-        
         # Exit action
         exit_action = QAction('E&xit', self)
         exit_action.setShortcut('Ctrl+Q')
@@ -1027,17 +1075,6 @@ class MainWindow(QMainWindow):
         if hasattr(self.artnet_listener, 'set_universes'):
             self.artnet_listener.set_universes(universes)
 
-    def _open_dmx_recorder(self):
-        """Open the DMX recorder dialog."""
-        # Get DMX recorder settings from config
-        dmx_recorder_config = self.config.get('dmx_recorder', {})
-        recording_dir = dmx_recorder_config.get('recording_dir', 'recordings')
-        
-        # Create and show dialog
-        dialog = DMXRecorderDialog(self.artnet_listener, self)
-        dialog.recorder.recording_dir = recording_dir
-        dialog.exec()
-
 def get_pattern_type_from_string(pattern_str):
     """Convert pattern string from config to PatternType enum"""
     try:
@@ -1059,6 +1096,12 @@ def main():
     
     artnet_config = config.get('artnet', {})
     test_config = config.get('test_source', {})
+    
+    # Check for debug flags
+    global DEBUG_MEMORY
+    DEBUG_MEMORY = "--debug-memory" in sys.argv
+    if DEBUG_MEMORY:
+        print("Memory debugging enabled")
     
     # Determine whether to use test source or real Art-Net listener
     use_test_source = test_config.get('enabled', False)
@@ -1099,6 +1142,10 @@ def main():
     # Create and run the application
     app = QApplication(sys.argv)
     
+    # Set up memory tracking if needed and available
+    if DEBUG_MEMORY and MEMORY_TRACKING_AVAILABLE:
+        setup_memory_tracking(app)
+    
     # Set organization and application names for QSettings
     app.setOrganizationName("ArtNetViz")
     app.setOrganizationDomain("artnetviz.local")
@@ -1121,7 +1168,33 @@ def main():
     # Stop the data source before exiting
     data_source.stop()
     
+    # Perform final memory check if needed
+    if DEBUG_MEMORY and MEMORY_TRACKING_AVAILABLE:
+        print("\n=== Final Memory Analysis ===")
+        memory_snapshot()
+        memory_tracker.stop()
+    
     sys.exit(exit_code)
 
 if __name__ == "__main__":
-    main() 
+    main()
+
+# Add this to your main app loop or a timer function
+def periodic_cleanup():
+    gc.collect()
+
+def log_memory_usage():
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / (1024 * 1024)
+    print(f"Memory usage: {memory_mb:.2f} MB")
+
+# Start at application beginning
+tracemalloc.start()
+
+# Add this to a debug menu option
+def show_memory_snapshot():
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics('lineno')
+    for stat in top_stats[:10]:
+        print(stat) 
