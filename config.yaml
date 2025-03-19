@@ -15,7 +15,7 @@ canvas_width: 0
 frame_rate: 50
 gap_x: 0
 gap_y: 0
-pixel_size: 4
+pixel_size: 1
 start_x: 0
 start_y: 0
 test_source:

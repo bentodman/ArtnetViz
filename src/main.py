@@ -215,10 +215,10 @@ class CanvasWidget(QWidget):
             if self.full_res_pixmap is None or self.full_res_pixmap.width() != canvas_width or self.full_res_pixmap.height() != canvas_height:
                 if self.full_res_pixmap is not None:
                     del self.full_res_pixmap
-                    gc.collect()
-                
                 self.full_res_pixmap = QPixmap(canvas_width, canvas_height)
                 print(f"Created new full-res pixmap: {canvas_width}x{canvas_height}")
+            else:
+                self.full_res_pixmap.fill(Qt.GlobalColor.transparent)
             
             # Check if we need to resize the preview pixmap
             preview_width = canvas_width
@@ -238,77 +238,79 @@ class CanvasWidget(QWidget):
             if self.pixmap is None or self.pixmap.width() != preview_width or self.pixmap.height() != preview_height:
                 if self.pixmap is not None:
                     del self.pixmap
-                    gc.collect()
-                
                 self.pixmap = QPixmap(preview_width, preview_height)
+            else:
+                self.pixmap.fill(Qt.GlobalColor.transparent)
             
-            # Clear both pixmaps
-            self.full_res_pixmap.fill(Qt.GlobalColor.transparent)
-            self.pixmap.fill(Qt.GlobalColor.transparent)
+            # Create local QPainter objects
+            full_res_painter = QPainter(self.full_res_pixmap)
+            painter = QPainter(self.pixmap)
             
-            # Create new painters for each frame
-            self._full_res_painter = QPainter(self.full_res_pixmap)
-            self._painter = QPainter(self.pixmap)
-            
-            # Draw DMX data
-            for i, universe in enumerate(universes):
-                dmx_data = self.artnet_listener.get_buffer(universe)
-                if dmx_data is None:
-                    continue
+            try:
+                # Draw DMX data
+                for i, universe in enumerate(universes):
+                    dmx_data = self.artnet_listener.get_buffer(universe)
+                    if dmx_data is None:
+                        continue
+                    
+                    # Calculate row position
+                    row_y = self.start_y + (i * pixel_height_with_gap)
+                    
+                    # Draw each DMX channel as a pixel
+                    for j in range(min(len(dmx_data), 512)):
+                        # Calculate pixel position
+                        pixel_x = self.start_x + (j * pixel_width_with_gap)
+                        
+                        # Get DMX value (0-255)
+                        value = dmx_data[j]
+                        
+                        # Create color based on DMX value
+                        color = QColor(value, value, value)
+                        
+                        # Draw on both pixmaps
+                        full_res_painter.fillRect(pixel_x, row_y, self.pixel_size, self.pixel_size, color)
+                        
+                        # Scale preview coordinates
+                        preview_x = int(pixel_x * (preview_width / canvas_width))
+                        preview_y = int(row_y * (preview_height / canvas_height))
+                        preview_size = int(self.pixel_size * (preview_width / canvas_width))
+                        
+                        painter.fillRect(preview_x, preview_y, preview_size, preview_size, color)
                 
-                # Calculate row position
-                row_y = self.start_y + (i * pixel_height_with_gap)
+                # End painters
+                full_res_painter.end()
+                painter.end()
                 
-                # Draw each DMX channel as a pixel
-                for j in range(min(len(dmx_data), 512)):
-                    # Calculate pixel position
-                    pixel_x = self.start_x + (j * pixel_width_with_gap)
-                    
-                    # Get DMX value (0-255)
-                    value = dmx_data[j]
-                    
-                    # Create color based on DMX value
-                    color = QColor(value, value, value)
-                    
-                    # Draw on both pixmaps
-                    self._full_res_painter.fillRect(pixel_x, row_y, self.pixel_size, self.pixel_size, color)
-                    
-                    # Scale preview coordinates
-                    preview_x = int(pixel_x * (preview_width / canvas_width))
-                    preview_y = int(row_y * (preview_height / canvas_height))
-                    preview_size = int(self.pixel_size * (preview_width / canvas_width))
-                    
-                    self._painter.fillRect(preview_x, preview_y, preview_size, preview_size, color)
-            
-            # End painters
-            self._full_res_painter.end()
-            self._painter.end()
-            
-            # Update Syphon frame
-            self.update_syphon_frame()
-            
-            # Force update of the widget
-            self.update()
-            
-            # Periodic cleanup and memory check
-            self._frame_counter += 1
-            if self._frame_counter % 10 == 0:
-                gc.collect()
+                # Update Syphon frame
+                self.update_syphon_frame()
                 
-                # Check memory usage periodically
-                if self._frame_counter % self._memory_check_interval == 0:
+                # Force update of the widget
+                self.update()
+                
+                # Periodic cleanup and memory check
+                self._frame_counter += 1
+                if self._frame_counter % 60 == 0:
+                    gc.collect()
+                    # Log memory usage every 60 frames
                     process = psutil.Process()
                     memory_info = process.memory_info()
                     memory_mb = memory_info.rss / (1024 * 1024)
-                    print(f"Memory usage at frame {self._frame_counter}: {memory_mb:.2f} MB")
-                    
-                    # Take a memory snapshot if tracemalloc is enabled
+                    print(f"[DEBUG-MEM] Memory usage at frame {self._frame_counter}: {memory_mb:.2f} MB")
                     if tracemalloc.is_tracing():
                         snapshot = tracemalloc.take_snapshot()
                         top_stats = snapshot.statistics('lineno')
-                        print("\nTop memory allocations:")
+                        print(f"[DEBUG-MEM] Top 5 memory allocations at frame {self._frame_counter}:")
                         for stat in top_stats[:5]:
-                            print(f"{stat}")
+                            print(f"[DEBUG-MEM] {stat}")
+            finally:
+                # Ensure painters are properly cleaned up
+                if full_res_painter.isActive():
+                    full_res_painter.end()
+                if painter.isActive():
+                    painter.end()
+                del full_res_painter
+                del painter
+                gc.collect()
         elif self.verbose:
             print("No universes found. Canvas not updated.")
     
@@ -316,7 +318,7 @@ class CanvasWidget(QWidget):
         """Update Syphon server with full-resolution pixmap content"""
         if not self.server or not self.full_res_pixmap:
             return
-            
+        
         try:
             # Always use the full resolution pixmap for Syphon output
             image = self.full_res_pixmap.toImage()
@@ -333,50 +335,51 @@ class CanvasWidget(QWidget):
             # Convert QImage to NumPy array for Syphon
             ptr = image.bits()
             ptr.setsize(height * width * 4)
-            
             arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 4))
             
             # Flip the image vertically for Syphon (corrects the upside-down issue)
             arr = np.flip(arr, axis=0)
             
             if self.using_metal:
-                # Metal-based Syphon server
+                # Metal-based Syphon server with texture caching
                 try:
-                    # Create Metal texture with the appropriate device
-                    mtl_texture = create_mtl_texture(
-                        device=self.metal_device,
-                        width=width,
-                        height=height
-                    )
-                    
-                    # Copy NumPy array to Metal texture
-                    copy_image_to_mtl_texture(arr, mtl_texture)
-                    
-                    # Publish the texture to Syphon
-                    self.server.publish_frame_texture(mtl_texture)
-                    
+                    if (not hasattr(self, 'cached_mtl_texture') or self.cached_mtl_texture is None or
+                        not hasattr(self, 'cached_mtl_texture_dims') or self.cached_mtl_texture_dims != (width, height)):
+                        if hasattr(self, 'cached_mtl_texture') and self.cached_mtl_texture is not None:
+                            del self.cached_mtl_texture
+                        self.cached_mtl_texture = create_mtl_texture(device=self.metal_device, width=width, height=height)
+                        self.cached_mtl_texture_dims = (width, height)
+                        print(f"[DEBUG-MEM] Created cached mtl_texture: {width}x{height}")
+                    copy_image_to_mtl_texture(arr, self.cached_mtl_texture)
+                    self.server.publish_frame_texture(self.cached_mtl_texture)
                 except Exception as e:
                     print(f"Error updating Metal Syphon: {e}")
             else:
                 # Legacy Syphon server
                 try:
-                    # For legacy server, we need to use the appropriate interface
                     self.server.publish_frame_nparray(arr, (width, height))
                 except Exception as e:
                     print(f"Error updating legacy Syphon: {e}")
-                    # Try to use the fallback method if the first one fails
+                    # Try fallback using texture creation
                     try:
                         if hasattr(self.server, 'device'):
-                            # If server has a device, use it
                             texture = create_mtl_texture(device=self.server.device, width=width, height=height)
                             copy_image_to_mtl_texture(arr, texture)
                             self.server.publish_frame_texture(texture)
+                            del texture  # Free texture reference
                     except Exception as fallback_e:
                         print(f"Fallback Syphon update also failed: {fallback_e}")
-                        
         except Exception as e:
-            # Catch any other exceptions to prevent app crashes
-            print(f"Error in Syphon frame update: {e}")
+            print(f"Error in update_syphon_frame: {e}")
+        finally:
+            # Clean up temporary objects from QImage conversion
+            if 'arr' in locals():
+                del arr
+            if 'image' in locals():
+                del image
+            if 'ptr' in locals():
+                del ptr
+            gc.collect()
     
     def paintEvent(self, event):
         """Paint the canvas on the widget"""
@@ -452,6 +455,20 @@ class CanvasWidget(QWidget):
         
         if hasattr(self, 'pixmap'):
             del self.pixmap
+            
+        # Clean up Metal textures
+        if hasattr(self, 'cached_mtl_texture') and self.cached_mtl_texture is not None:
+            try:
+                del self.cached_mtl_texture
+            except:
+                pass
+                
+        if hasattr(self, 'cached_mtl_texture_dims'):
+            del self.cached_mtl_texture_dims
+            
+        # Clean up Metal device
+        if hasattr(self, 'metal_device'):
+            del self.metal_device
         
         # Force a garbage collection
         gc.collect()
@@ -463,6 +480,9 @@ class CanvasWidget(QWidget):
                 print("Syphon server stopped")
             except Exception as e:
                 print(f"Error stopping Syphon server: {e}")
+                
+        # Final cleanup
+        gc.collect()
 
     def __del__(self):
         """Clean up resources when object is deleted"""
@@ -1197,4 +1217,9 @@ def show_memory_snapshot():
     snapshot = tracemalloc.take_snapshot()
     top_stats = snapshot.statistics('lineno')
     for stat in top_stats[:10]:
-        print(stat) 
+        print(stat)
+
+def log_memory(message=""):
+    process = psutil.Process()
+    mem_mb = process.memory_info().rss / (1024*1024)
+    print(f"[MEMORY] {message}: {mem_mb:.2f} MB") 
