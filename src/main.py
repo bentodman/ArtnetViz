@@ -136,6 +136,16 @@ class CanvasWidget(QWidget):
         # Frame counter for periodic cleanup
         self._frame_counter = 0
         
+        # Cache for color objects
+        self._color_cache = {}
+        
+        # Cache for coordinate calculations
+        self._coordinate_cache = {}
+        
+        # Cache for Syphon frame data
+        self._syphon_array = None
+        self._syphon_array_dims = None
+        
         self.update_canvas()
 
     def init_syphon(self):
@@ -146,11 +156,29 @@ class CanvasWidget(QWidget):
             
             # Create and start Syphon server
             if metal_available and hasattr(syphon, 'SyphonMetalServer'):
-                # Use Metal-based Syphon server (newer approach)
-                self.server = syphon.SyphonMetalServer("ArtNet Visualizer")
-                self.metal_device = Metal.MTLCreateSystemDefaultDevice()
-                print("Syphon server started (Metal interface)")
-                self.using_metal = True
+                try:
+                    # Create Metal device first and validate
+                    self.metal_device = Metal.MTLCreateSystemDefaultDevice()
+                    if not self.metal_device:
+                        raise RuntimeError("Failed to create Metal device")
+                    
+                    # Create Syphon server with error checking
+                    self.server = syphon.SyphonMetalServer("ArtNet Visualizer")
+                    if not self.server:
+                        raise RuntimeError("Failed to create Syphon server")
+                        
+                    print("Syphon server started (Metal interface)")
+                    self.using_metal = True
+                except Exception as metal_error:
+                    print(f"Metal initialization failed: {metal_error}")
+                    # Fall back to legacy server if Metal fails
+                    if hasattr(syphon, 'SyphonServer'):
+                        self.server = syphon.SyphonServer()
+                        self.server.start(name="ArtNet Visualizer", dimensions=(512, 10))
+                        print("Syphon server started (legacy interface)")
+                        self.using_metal = False
+                    else:
+                        raise RuntimeError("No supported Syphon implementation available")
             elif hasattr(syphon, 'SyphonServer'):
                 # Use legacy Syphon server
                 self.server = syphon.SyphonServer()
@@ -165,6 +193,7 @@ class CanvasWidget(QWidget):
             print(f"Error initializing Syphon: {e}")
             self.server = None
             self.using_metal = False
+            # Don't raise the exception - allow the app to continue without Syphon
 
     def set_frame_rate(self, fps):
         """Set the frame rate for canvas updates"""
@@ -182,6 +211,22 @@ class CanvasWidget(QWidget):
         
         if self.verbose:
             print(f"Frame rate set to {fps} FPS (interval: {interval_ms}ms)")
+
+    def _get_cached_color(self, value):
+        """Get a cached QColor object for the given DMX value"""
+        if value not in self._color_cache:
+            self._color_cache[value] = QColor(value, value, value)
+        return self._color_cache[value]
+
+    def _get_cached_coordinates(self, pixel_x, row_y, preview_width, canvas_width, preview_height, canvas_height):
+        """Get cached coordinates for preview scaling"""
+        key = (pixel_x, row_y, preview_width, canvas_width, preview_height, canvas_height)
+        if key not in self._coordinate_cache:
+            preview_x = int(pixel_x * (preview_width / canvas_width))
+            preview_y = int(row_y * (preview_height / canvas_height))
+            preview_size = int(self.pixel_size * (preview_width / canvas_width))
+            self._coordinate_cache[key] = (preview_x, preview_y, preview_size)
+        return self._coordinate_cache[key]
 
     def update_canvas(self):
         """Update the canvas with the current Art-Net DMX data"""
@@ -264,16 +309,16 @@ class CanvasWidget(QWidget):
                         # Get DMX value (0-255)
                         value = dmx_data[j]
                         
-                        # Create color based on DMX value
-                        color = QColor(value, value, value)
+                        # Get cached color
+                        color = self._get_cached_color(value)
                         
                         # Draw on both pixmaps
                         full_res_painter.fillRect(pixel_x, row_y, self.pixel_size, self.pixel_size, color)
                         
-                        # Scale preview coordinates
-                        preview_x = int(pixel_x * (preview_width / canvas_width))
-                        preview_y = int(row_y * (preview_height / canvas_height))
-                        preview_size = int(self.pixel_size * (preview_width / canvas_width))
+                        # Get cached coordinates
+                        preview_x, preview_y, preview_size = self._get_cached_coordinates(
+                            pixel_x, row_y, preview_width, canvas_width, preview_height, canvas_height
+                        )
                         
                         painter.fillRect(preview_x, preview_y, preview_size, preview_size, color)
                 
@@ -290,7 +335,11 @@ class CanvasWidget(QWidget):
                 # Periodic cleanup and memory check
                 self._frame_counter += 1
                 if self._frame_counter % 60 == 0:
+                    # Clear caches periodically to prevent memory growth
+                    self._color_cache.clear()
+                    self._coordinate_cache.clear()
                     gc.collect()
+                    
                     # Log memory usage every 60 frames
                     process = psutil.Process()
                     memory_info = process.memory_info()
@@ -322,7 +371,10 @@ class CanvasWidget(QWidget):
         try:
             # Always use the full resolution pixmap for Syphon output
             image = self.full_res_pixmap.toImage()
-            
+            if not image:
+                print("Warning: Failed to convert pixmap to image")
+                return
+                
             # Verify dimensions will work with Metal texture limits (16384 max)
             width = min(image.width(), 16384)  # Limit to max Metal texture size
             height = min(image.height(), 16384)  # Limit to max Metal texture size
@@ -332,13 +384,32 @@ class CanvasWidget(QWidget):
                 print(f"WARNING: Image dimensions ({image.width()}x{image.height()}) exceed Metal texture limits. Scaling to {width}x{height}")
                 image = image.scaled(width, height, aspectRatioMode=Qt.AspectRatioMode.KeepAspectRatio)
             
-            # Convert QImage to NumPy array for Syphon
-            ptr = image.bits()
-            ptr.setsize(height * width * 4)
-            arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 4))
-            
-            # Flip the image vertically for Syphon (corrects the upside-down issue)
-            arr = np.flip(arr, axis=0)
+            # Check if we need to update the cached array
+            if (self._syphon_array is None or 
+                self._syphon_array_dims != (width, height)):
+                
+                # Convert QImage to NumPy array for Syphon
+                ptr = image.bits()
+                if not ptr:
+                    print("Warning: Failed to get image bits")
+                    return
+                    
+                ptr.setsize(height * width * 4)
+                self._syphon_array = np.frombuffer(ptr, np.uint8).reshape((height, width, 4))
+                self._syphon_array_dims = (width, height)
+                
+                # Flip the image vertically for Syphon (corrects the upside-down issue)
+                self._syphon_array = np.flip(self._syphon_array, axis=0)
+            else:
+                # Update existing array with new data
+                ptr = image.bits()
+                if not ptr:
+                    print("Warning: Failed to get image bits")
+                    return
+                    
+                ptr.setsize(height * width * 4)
+                np.copyto(self._syphon_array, np.frombuffer(ptr, np.uint8).reshape((height, width, 4)))
+                self._syphon_array = np.flip(self._syphon_array, axis=0)
             
             if self.using_metal:
                 # Metal-based Syphon server with texture caching
@@ -346,35 +417,66 @@ class CanvasWidget(QWidget):
                     if (not hasattr(self, 'cached_mtl_texture') or self.cached_mtl_texture is None or
                         not hasattr(self, 'cached_mtl_texture_dims') or self.cached_mtl_texture_dims != (width, height)):
                         if hasattr(self, 'cached_mtl_texture') and self.cached_mtl_texture is not None:
-                            del self.cached_mtl_texture
+                            try:
+                                del self.cached_mtl_texture
+                            except:
+                                pass
+                                
+                        # Validate Metal device before creating texture
+                        if not hasattr(self, 'metal_device') or not self.metal_device:
+                            print("Warning: Metal device not available")
+                            return
+                            
                         self.cached_mtl_texture = create_mtl_texture(device=self.metal_device, width=width, height=height)
+                        if not self.cached_mtl_texture:
+                            print("Warning: Failed to create Metal texture")
+                            return
+                            
                         self.cached_mtl_texture_dims = (width, height)
-                        print(f"[DEBUG-MEM] Created cached mtl_texture: {width}x{height}")
-                    copy_image_to_mtl_texture(arr, self.cached_mtl_texture)
-                    self.server.publish_frame_texture(self.cached_mtl_texture)
+                        
+                    # Copy image data to texture
+                    try:
+                        copy_image_to_mtl_texture(self._syphon_array, self.cached_mtl_texture)
+                    except Exception as copy_error:
+                        print(f"Error copying image to Metal texture: {copy_error}")
+                        return
+                        
+                    # Publish frame
+                    try:
+                        self.server.publish_frame_texture(self.cached_mtl_texture)
+                    except Exception as publish_error:
+                        print(f"Error publishing frame: {publish_error}")
+                        return
+                        
                 except Exception as e:
-                    print(f"Error updating Metal Syphon: {e}")
+                    print(f"Error in Metal Syphon update: {e}")
+                    # Try fallback to legacy mode if Metal fails
+                    self.using_metal = False
+                    if hasattr(self.server, 'publish_frame_nparray'):
+                        try:
+                            self.server.publish_frame_nparray(self._syphon_array, (width, height))
+                        except Exception as legacy_error:
+                            print(f"Legacy fallback also failed: {legacy_error}")
             else:
                 # Legacy Syphon server
                 try:
-                    self.server.publish_frame_nparray(arr, (width, height))
+                    self.server.publish_frame_nparray(self._syphon_array, (width, height))
                 except Exception as e:
                     print(f"Error updating legacy Syphon: {e}")
                     # Try fallback using texture creation
                     try:
                         if hasattr(self.server, 'device'):
                             texture = create_mtl_texture(device=self.server.device, width=width, height=height)
-                            copy_image_to_mtl_texture(arr, texture)
-                            self.server.publish_frame_texture(texture)
-                            del texture  # Free texture reference
+                            if texture:
+                                copy_image_to_mtl_texture(self._syphon_array, texture)
+                                self.server.publish_frame_texture(texture)
+                                del texture  # Free texture reference
                     except Exception as fallback_e:
                         print(f"Fallback Syphon update also failed: {fallback_e}")
         except Exception as e:
             print(f"Error in update_syphon_frame: {e}")
         finally:
-            # Clean up temporary objects from QImage conversion
-            if 'arr' in locals():
-                del arr
+            # Clean up temporary objects
             if 'image' in locals():
                 del image
             if 'ptr' in locals():
@@ -428,8 +530,18 @@ class CanvasWidget(QWidget):
     
     def cleanup(self):
         """Clean up resources"""
-        if self.update_timer:
-            self.update_timer.stop()
+        # Safely stop the timer
+        if hasattr(self, 'update_timer') and self.update_timer is not None:
+            try:
+                if self.update_timer.isActive():
+                    self.update_timer.stop()
+            except RuntimeError:
+                # Ignore RuntimeError if the timer has already been deleted
+                pass
+            except Exception as e:
+                print(f"Error stopping timer: {e}")
+            finally:
+                del self.update_timer
         
         # Clean up painters
         if self._painter is not None:
