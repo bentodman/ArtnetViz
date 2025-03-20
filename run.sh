@@ -57,7 +57,7 @@ echo -e "${YELLOW}Checking dependencies...${NC}"
 MISSING_DEPS=false
 
 check_dependency() {
-    if ! python -c "import $1" 2>/dev/null; then
+    if ! python3 -c "import $1" 2>/dev/null; then
         echo -e "${RED}Package '$1' is not installed correctly.${NC}"
         MISSING_DEPS=true
     fi
@@ -134,12 +134,12 @@ with open(log_file, 'w') as f:
 EOF
     
     # Run the app without debug memory flag
-    PYTHONPATH=src python src/main.py &
+    PYTHONPATH=. python3 -m src.main &
     APP_PID=$!
     
     # Run the monitor in background
     LOG_FILE="memory_usage_$(date +%Y%m%d_%H%M%S).csv"
-    python monitor_memory.py $APP_PID $LOG_FILE &
+    python3 monitor_memory.py $APP_PID $LOG_FILE &
     MONITOR_PID=$!
     
     # Wait for the app to finish
@@ -196,7 +196,7 @@ else:
 EOF
     
     # Execute the temporary script
-    python $TEMP_FILE
+    python3 $TEMP_FILE
     EXIT_CODE=$?
     
     # Clean up
@@ -209,15 +209,15 @@ elif [ "$1" == "--debug-syphon" ]; then
     echo -e "${YELLOW}This client will connect to your Syphon server and display frames${NC}"
     
     # Run the debug client
-    python debug_syphon.py
+    python3 debug_syphon.py
     EXIT_CODE=$?
 else
     # Run the application normally without any debug flags
     if [ "$USE_CAFFEINATE" = true ]; then
         echo -e "${GREEN}Running with caffeinate to prevent App Nap...${NC}"
-        caffeinate -d -i -m -s PYTHONPATH=src python src/main.py
+        PYTHONPATH=. caffeinate -d -i -m -s python3 -m src.main
     else
-        PYTHONPATH=src python src/main.py
+        PYTHONPATH=. python3 -m src.main
     fi
     EXIT_CODE=$?
 fi

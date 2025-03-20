@@ -95,11 +95,11 @@ except ImportError:
     pass
 
 # Import our custom Art-Net listener and test source
-from artnet_listener import ArtNetListener
-from artnet_test_source import ArtNetTestSource, PatternType
+from src.artnet_listener import ArtNetListener
+from src.artnet_test_source import ArtNetTestSource, PatternType
 
 # Import shared configuration
-from config import DEBUG_MEMORY
+from src.config import DEBUG_MEMORY
 
 # Global variables
 _app_nap_activity = None  # Will hold the NSActivity reference for App Nap prevention
@@ -123,7 +123,7 @@ def cleanup_app_nap():
 atexit.register(cleanup_app_nap)
 
 # Import our settings dialog
-from settings_dialog import SettingsDialog, load_config_from_file
+from src.settings_dialog import SettingsDialog, load_config_from_file
 
 # Import memory tracking utilities
 try:
@@ -287,70 +287,76 @@ class CanvasWidget(QWidget):
                     import Metal
                     import syphon.utils.numpy
                     
+                    # Verify Metal is fully available
+                    if not hasattr(Metal, 'MTLCreateSystemDefaultDevice'):
+                        print("Metal module found but MTLCreateSystemDefaultDevice not available")
+                        raise ImportError("Metal implementation incomplete")
+                    
                     # Create Metal device
                     self.metal_device = Metal.MTLCreateSystemDefaultDevice()
                     if not self.metal_device:
+                        print("Could not create Metal device - hardware may not support Metal API")
                         raise RuntimeError("Could not create Metal device")
                     
                     # Create command queue
                     self.metal_command_queue = self.metal_device.newCommandQueue()
                     if not self.metal_command_queue:
+                        print("Could not create Metal command queue")
                         raise RuntimeError("Could not create Metal command queue")
+                    
+                    # Initialize texture tracking
+                    self._texture_tracker = {}  # Format: {texture_id: {size: (w, h), created_at: frame_num, last_used: frame_num}}
+                    self._texture_pool = {}  # Format: {(width, height): [textures]}
+                    self._texture_dimensions = (0, 0)
+                    self._total_textures_created = 0
+                    self._total_textures_released = 0
+                    self._frame_counter = 0
+                    self._debug_memory = hasattr(self, '_memory_tracking_enabled') and self._memory_tracking_enabled
                     
                     # Create server with Metal backend
                     self.server = syphon.SyphonMetalServer("ArtNetViz Syphon",
                                                       self.metal_device,
                                                       self.metal_command_queue)
                     if not self.server:
+                        print("Could not create Syphon Metal server")
                         raise RuntimeError("Could not create Syphon Metal server")
                     
                     # Set flag to indicate we're using Metal
                     self.using_metal = True
                     
-                    print(f"Metal-based Syphon server initialized")
+                    print(f"Metal-based Syphon server initialized successfully")
                     # Record the available methods on this server
                     if self.server:
                         method_list = [method for method in dir(self.server) if not method.startswith('_')]
                         print(f"Available server methods: {', '.join(method_list[:10])}...")
-                        
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    print(f"Failed to initialize Metal-based Syphon: {e}")
-                    # Fall back to OpenGL-based Syphon
-                    self.using_metal = False
-            
-            # Fall back to OpenGL-based Syphon if Metal isn't available
-            if not self.using_metal:
-                try:
-                    # Initialize NSImage conversion
-                    self._init_ns_image_converter()
                     
-                    # Try legacy OpenGL-based Syphon classes
-                    if hasattr(syphon, 'SyphonServer'):
-                        print("Using legacy SyphonServer class")
-                        self.server = syphon.SyphonServer("ArtNetViz Syphon")
-                    elif hasattr(syphon, 'Server'):
-                        print("Using Server class")
-                        self.server = syphon.Server("ArtNetViz Syphon")
-                    else:
-                        print("No suitable Syphon server class found")
+                    # Create initial Metal texture
+                    self._init_metal_texture()
+                    
                 except Exception as e:
-                    print(f"Failed to initialize OpenGL-based Syphon: {e}")
-            
-            # NOTE: We don't initialize the update timer here anymore,
-            # it should be created by the CanvasWidget constructor and updated
-            # by set_frame_rate
+                    print(f"Error initializing Metal-based Syphon: {e}")
+                    self.using_metal = False
+                    if hasattr(self, 'metal_device'):
+                        self.metal_device = None
+                    if hasattr(self, 'metal_command_queue'):
+                        self.metal_command_queue = None
+                    if hasattr(self, 'server'):
+                        self.server = None
+                    
+                    # Try OpenGL fallback
+                    print("Falling back to OpenGL-based Syphon...")
+                    self._init_opengl_syphon()
+            else:
+                # No Metal support, try OpenGL
+                print("Metal-based Syphon not available, trying OpenGL...")
+                self._init_opengl_syphon()
                 
-            print("Syphon server initialized successfully")
-            print(f"Using Metal: {self.using_metal}")
-            
-        except ImportError:
+        except ImportError as e:
+            print(f"Syphon not available: {e}")
             self.syphon_available = False
-            print("Syphon module not available. Install 'syphon' package for Syphon support.")
         except Exception as e:
-            self.syphon_available = False
             print(f"Error initializing Syphon: {e}")
+            self.syphon_available = False
 
     def _init_update_timer(self):
         """Initialize the update timer with proper cleanup handling"""
@@ -471,7 +477,7 @@ class CanvasWidget(QWidget):
 
     def _init_metal_texture(self):
         """Initialize a Metal texture for Syphon frame publishing"""
-        if not self.using_metal:
+        if not hasattr(self, 'using_metal') or not self.using_metal:
             return
             
         from Foundation import NSAutoreleasePool
@@ -481,7 +487,7 @@ class CanvasWidget(QWidget):
         
         try:
             # Get the dimensions for the texture
-            if self.full_res_pixmap and not self.full_res_pixmap.isNull():
+            if hasattr(self, 'full_res_pixmap') and self.full_res_pixmap and not self.full_res_pixmap.isNull():
                 width = self.full_res_pixmap.width()
                 height = self.full_res_pixmap.height()
             else:
@@ -501,26 +507,27 @@ class CanvasWidget(QWidget):
                 return
                 
             # Check if we have a previously created texture with the same dimensions in the pool
-            if (width, height) in self._texture_pool and self._texture_pool[(width, height)]:
+            if hasattr(self, '_texture_pool') and (width, height) in self._texture_pool and self._texture_pool[(width, height)]:
                 # Reuse a texture from the pool
                 self.metal_texture = self._texture_pool[(width, height)].pop()
                 texture_id = id(self.metal_texture)
-                if self._debug_memory:
+                if hasattr(self, '_debug_memory') and self._debug_memory:
                     print(f"Reusing texture {texture_id} from pool for dimensions {width}x{height}")
                 
                 # Update dimensions
                 self._texture_dimensions = (width, height)
                 
                 # Update tracker
-                if texture_id in self._texture_tracker:
-                    self._texture_tracker[texture_id]['last_used'] = self._frame_counter
-                else:
-                    # Re-register if not in tracker
-                    self._texture_tracker[texture_id] = {
-                        'size': (width, height),
-                        'created_at': self._frame_counter,
-                        'last_used': self._frame_counter
-                    }
+                if hasattr(self, '_texture_tracker'):
+                    if texture_id in self._texture_tracker:
+                        self._texture_tracker[texture_id]['last_used'] = self._frame_counter
+                    else:
+                        # Re-register if not in tracker
+                        self._texture_tracker[texture_id] = {
+                            'size': (width, height),
+                            'created_at': self._frame_counter,
+                            'last_used': self._frame_counter
+                        }
                     
                 # Return early since we found a texture
                 return
@@ -543,7 +550,7 @@ class CanvasWidget(QWidget):
             # Store dimensions for future reference
             self._texture_dimensions = (width, height)
             
-            # Create texture descriptor
+            # Import Metal and create the texture
             import Metal
             descriptor = Metal.MTLTextureDescriptor.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
                 Metal.MTLPixelFormatBGRA8Unorm,
@@ -556,6 +563,21 @@ class CanvasWidget(QWidget):
             descriptor.setUsage_(Metal.MTLTextureUsageShaderRead | Metal.MTLTextureUsageRenderTarget)
             
             # Create the texture
+            if not hasattr(self, 'metal_device') or self.metal_device is None:
+                print("Metal device is not available - reinitializing...")
+                self.metal_device = Metal.MTLCreateSystemDefaultDevice()
+                if not self.metal_device:
+                    print("Could not create Metal device")
+                    return
+                
+                # Recreate command queue if needed
+                if not hasattr(self, 'metal_command_queue') or self.metal_command_queue is None:
+                    self.metal_command_queue = self.metal_device.newCommandQueue()
+                    if not self.metal_command_queue:
+                        print("Could not create Metal command queue")
+                        return
+            
+            # Create the texture
             self.metal_texture = self.metal_device.newTextureWithDescriptor_(descriptor)
             
             if not self.metal_texture:
@@ -566,18 +588,22 @@ class CanvasWidget(QWidget):
             self.metal_texture.setLabel_(f"ArtNetViz_Texture_{width}x{height}")
             
             # Register in texture tracker
-            texture_id = id(self.metal_texture)
-            self._texture_tracker[texture_id] = {
-                'size': (width, height),
-                'created_at': self._frame_counter,
-                'last_used': self._frame_counter
-            }
+            if hasattr(self, '_texture_tracker'):
+                texture_id = id(self.metal_texture)
+                self._texture_tracker[texture_id] = {
+                    'size': (width, height),
+                    'created_at': getattr(self, '_frame_counter', 0),
+                    'last_used': getattr(self, '_frame_counter', 0)
+                }
             
-            self._total_textures_created += 1
+            if hasattr(self, '_total_textures_created'):
+                self._total_textures_created += 1
             
-            if self._debug_memory:
+            if hasattr(self, '_debug_memory') and self._debug_memory:
+                texture_id = id(self.metal_texture)
                 print(f"Created new Metal texture {texture_id} with dimensions {width}x{height}")
-                print(f"Total textures: created={self._total_textures_created}, released={self._total_textures_released}")
+                if hasattr(self, '_total_textures_created') and hasattr(self, '_total_textures_released'):
+                    print(f"Total textures: created={self._total_textures_created}, released={self._total_textures_released}")
             
         except Exception as e:
             print(f"Error initializing Metal texture: {e}")
@@ -589,6 +615,10 @@ class CanvasWidget(QWidget):
 
     def _safely_release_texture(self, texture, from_pool=False):
         """Safely release a Metal texture."""
+        if texture is None:
+            return
+            
+        # Import required modules
         from Foundation import NSAutoreleasePool
         import objc
         import gc
@@ -597,51 +627,53 @@ class CanvasWidget(QWidget):
         pool = NSAutoreleasePool.alloc().init()
         
         try:
-            # Only attempt to release if texture exists
-            if texture is not None:
-                texture_id = id(texture)
+            texture_id = id(texture)
+            
+            # Check if texture is tracked
+            is_tracked = hasattr(self, '_texture_tracker') and texture_id in self._texture_tracker
+            
+            # Print verbose info
+            if hasattr(self, '_debug_memory') and self._debug_memory:
+                print(f"Releasing texture {texture_id} - was in pool: {from_pool}, was tracked: {is_tracked}")
+            
+            # Check if texture is still in any pool and remove it
+            if not from_pool and hasattr(self, '_texture_pool'):  # Only check if not already releasing from pool
+                for size, textures in list(self._texture_pool.items()):
+                    for i, pooled_texture in enumerate(textures):
+                        if id(pooled_texture) == texture_id:
+                            # Found in pool, remove it
+                            textures.pop(i)
+                            if hasattr(self, '_debug_memory') and self._debug_memory:
+                                print(f"Removed texture {texture_id} from pool during release")
+                            break
+            
+            # Remove from tracker
+            if is_tracked:
+                self._texture_tracker.pop(texture_id, None)
+            
+            # Explicitly set texture properties to nil before releasing
+            try:
+                # Get label for debugging
+                label = texture.label()
                 
-                # Check if texture is tracked
-                is_tracked = texture_id in self._texture_tracker
+                # Manually release the texture - this is a PyObjC object
+                texture.setPurgeableState_(0)  # Make sure it's not purgeable
+                texture.release()
                 
-                # Print verbose info
-                if self._debug_memory:
-                    print(f"Releasing texture {texture_id} - was in pool: {from_pool}, was tracked: {is_tracked}")
-                
-                # Check if texture is still in any pool and remove it
-                if from_pool == False:  # Only check if not already releasing from pool
-                    for size, textures in list(self._texture_pool.items()):
-                        for i, pooled_texture in enumerate(textures):
-                            if id(pooled_texture) == texture_id:
-                                # Found in pool, remove it
-                                textures.pop(i)
-                                if self._debug_memory:
-                                    print(f"Removed texture {texture_id} from pool during release")
-                                break
-                
-                # Remove from tracker
-                if is_tracked:
-                    self._texture_tracker.pop(texture_id, None)
+                if hasattr(self, '_total_textures_released'):
+                    self._total_textures_released += 1
                     
-                # Force release by explicitly nullifying all references and calling garbage collection
-                if hasattr(texture, 'release'):
-                    # If the texture has a release method, call it
-                    try:
-                        texture.release()
-                    except Exception as e:
-                        if self._debug_memory:
-                            print(f"Error calling release on texture: {e}")
+                if hasattr(self, '_debug_memory') and self._debug_memory:
+                    print(f"Successfully released texture {texture_id} (label: {label})")
+                    
+            except Exception as e:
+                print(f"Error during texture release of {texture_id}: {e}")
                 
-                # Set texture to None to break reference cycle
-                texture = None
+            # Suggest garbage collection
+            gc.collect()
                 
-                # Increment counter
-                self._total_textures_released += 1
-                
-                # Run a targeted garbage collection
-                gc.collect()
         except Exception as e:
-            print(f"Error safely releasing texture: {e}")
+            print(f"Error in _safely_release_texture: {e}")
         finally:
             # Always release the pool
             del pool
@@ -1026,6 +1058,7 @@ class CanvasWidget(QWidget):
     def _force_texture_recreation(self):
         """Force texture recreation to avoid Metal texture leaks."""
         from Foundation import NSAutoreleasePool
+        import gc
         
         # Create an autorelease pool
         pool = NSAutoreleasePool.alloc().init()
@@ -1033,20 +1066,59 @@ class CanvasWidget(QWidget):
         try:
             print("Forcing texture recreation...")
             
+            # Store current frame counter for later reference
+            self._last_texture_recreation = getattr(self, '_frame_counter', 0)
+            
             # Release the current texture if it exists
             if hasattr(self, 'metal_texture') and self.metal_texture:
-                # Get the current dimensions before releasing
-                dimensions = self._texture_dimensions
+                try:
+                    # Get the current dimensions before releasing
+                    dimensions = getattr(self, '_texture_dimensions', (0, 0))
+                    
+                    # Get texture ID for logging
+                    texture_id = id(self.metal_texture)
+                    print(f"Releasing current texture {texture_id} with dimensions {dimensions}")
+                    
+                    # Release the current texture
+                    self._safely_release_texture(self.metal_texture)
+                    self.metal_texture = None
+                    
+                    # Reset the texture dimensions
+                    self._texture_dimensions = (0, 0)
+                    
+                except Exception as e:
+                    print(f"Error releasing texture during recreation: {e}")
+                    # Still clear the reference even if release fails
+                    self.metal_texture = None
+            
+            # Clear out any textures that might be lingering
+            gc.collect()
+            
+            # Also trim down the texture pool
+            if hasattr(self, '_texture_pool'):
+                # Count pooled textures
+                pool_count = 0
+                for size, textures in list(self._texture_pool.items()):
+                    pool_count += len(textures)
                 
-                # Release the current texture
-                self._safely_release_texture(self.metal_texture)
-                self.metal_texture = None
+                # Report the pool state
+                print(f"Texture pool contains {pool_count} textures before cleanup")
                 
-                # Reset the texture dimensions
-                self._texture_dimensions = (0, 0)
+                # Reduce the pool size significantly during recreation
+                self._trim_texture_pool()
                 
-                # Create a new texture (will happen on next frame)
-                print("Texture will be recreated on next frame")
+                # Count pooled textures after trimming
+                pool_count = 0
+                for size, textures in list(self._texture_pool.items()):
+                    pool_count += len(textures)
+                
+                print(f"Texture pool contains {pool_count} textures after cleanup")
+            
+            print("Texture will be recreated on next frame")
+            
+            # Force a garbage collection pass
+            gc.collect()
+            
         except Exception as e:
             print(f"Error forcing texture recreation: {e}")
         finally:
@@ -1467,6 +1539,7 @@ class CanvasWidget(QWidget):
                     if not hasattr(self, 'metal_texture') or self.metal_texture is None:
                         if self._frame_counter % 60 == 0:
                             print("Skipping frame - no valid Metal texture")
+                        del pool
                         return
                     
                     # Copy pixmap data to metal texture
@@ -1475,11 +1548,13 @@ class CanvasWidget(QWidget):
                             # Convert QPixmap to QImage in RGBA format (only once)
                             image = self.full_res_pixmap.toImage()
                             if image.isNull():
+                                del pool
                                 return
                                 
                             if image.format() != QImage.Format.Format_RGBA8888:
                                 image = image.convertToFormat(QImage.Format.Format_RGBA8888)
                                 if image.isNull():
+                                    del pool
                                     return
                             
                             # Use most direct approach possible for copying data
@@ -1507,12 +1582,23 @@ class CanvasWidget(QWidget):
                                     # Copy data from buffer to our pooled array
                                     np.copyto(pixel_array, buffer.reshape((height, width, 4)))
                                     
-                                    # Copy pixel data to Metal texture (with null check)
-                                    if self.metal_texture is not None:
-                                        copy_image_to_mtl_texture(pixel_array, self.metal_texture)
+                                    # Additional check for valid texture
+                                    if (self.metal_texture is not None and 
+                                        hasattr(self.metal_texture, 'width') and 
+                                        self.metal_texture.width() == width and 
+                                        self.metal_texture.height() == height):
+                                        try:
+                                            # Copy pixel data to Metal texture
+                                            copy_image_to_mtl_texture(pixel_array, self.metal_texture)
+                                        except Exception as e:
+                                            print(f"Error copying data to texture: {e}")
+                                            # Recreate texture next frame
+                                            self._force_texture_recreation()
                                     else:
                                         if self._frame_counter % 60 == 0:
-                                            print("Skipping texture update - texture is None")
+                                            print("Skipping texture update - texture dimensions mismatch")
+                                            # Force texture recreation
+                                            self._force_texture_recreation()
                                             
                                     # Return the array to the pool
                                     self._return_array_to_pool(pixel_array)
@@ -1530,12 +1616,23 @@ class CanvasWidget(QWidget):
                                             row_data = buffer[row_start:row_end].reshape(width, 4)
                                             pixel_array[y] = row_data
                                     
-                                    # Copy pixel data to Metal texture (with null check)
-                                    if self.metal_texture is not None:
-                                        copy_image_to_mtl_texture(pixel_array, self.metal_texture)
+                                    # Additional check for valid texture
+                                    if (self.metal_texture is not None and 
+                                        hasattr(self.metal_texture, 'width') and 
+                                        self.metal_texture.width() == width and 
+                                        self.metal_texture.height() == height):
+                                        try:
+                                            # Copy pixel data to Metal texture
+                                            copy_image_to_mtl_texture(pixel_array, self.metal_texture)
+                                        except Exception as e:
+                                            print(f"Error copying data to texture: {e}")
+                                            # Recreate texture next frame
+                                            self._force_texture_recreation()
                                     else:
                                         if self._frame_counter % 60 == 0:
-                                            print("Skipping texture update - texture is None")
+                                            print("Skipping texture update - texture dimensions mismatch")
+                                            # Force texture recreation
+                                            self._force_texture_recreation()
                                             
                                     # Return the array to the pool
                                     self._return_array_to_pool(pixel_array)
@@ -1550,14 +1647,24 @@ class CanvasWidget(QWidget):
                                 # Check that texture is valid and server exists
                                 if (self.server is not None and hasattr(self.server, 'publish_frame_texture') and
                                     self.metal_texture is not None):
-                                    self.server.publish_frame_texture(
-                                        texture=self.metal_texture, 
-                                        is_flipped=True  # Explicitly set is_flipped parameter
-                                    )
-                                    
-                                    # Log occasionally
-                                    if self._frame_counter % 300 == 0:
-                                        print(f"Metal frame published: {width}x{height}")
+                                    # Double check texture dimensions before publishing
+                                    if (hasattr(self.metal_texture, 'width') and 
+                                        self.metal_texture.width() == width and 
+                                        self.metal_texture.height() == height):
+                                        self.server.publish_frame_texture(
+                                            texture=self.metal_texture, 
+                                            is_flipped=True  # Explicitly set is_flipped parameter
+                                        )
+                                        
+                                        # Log occasionally
+                                        if self._frame_counter % 300 == 0:
+                                            print(f"Metal frame published: {width}x{height}")
+                                    else:
+                                        # Dimensions mismatch, recreate texture
+                                        if self._frame_counter % 60 == 0:
+                                            print(f"Texture dimensions mismatch: expected {width}x{height}, " +
+                                                 f"got {self.metal_texture.width()}x{self.metal_texture.height()}")
+                                        self._force_texture_recreation()
                                 elif self.server is not None:
                                     # Fallback to simple publish
                                     self.server.publish()
@@ -1566,7 +1673,7 @@ class CanvasWidget(QWidget):
                                         print("Using basic publish() method")
                                 else:
                                     if self._frame_counter % 300 == 0:
-                                        print("Cannot publish - server is None")
+                                        print("No server available for publishing")
                                 
                             except Exception as e:
                                 print(f"Error in frame publishing: {e}")
@@ -2279,6 +2386,34 @@ class CanvasWidget(QWidget):
             return mem_info.rss / (1024 * 1024)
         else:
             return 0
+
+    def _init_opengl_syphon(self):
+        """Initialize OpenGL-based Syphon as a fallback when Metal isn't available"""
+        try:
+            import syphon
+            
+            # Initialize NSImage conversion if needed for OpenGL mode
+            if not hasattr(self, 'nsimage_context'):
+                self._init_ns_image_converter()
+            
+            # Try legacy OpenGL-based Syphon classes
+            if hasattr(syphon, 'SyphonServer'):
+                print("Using legacy SyphonServer class")
+                self.server = syphon.SyphonServer("ArtNetViz Syphon")
+            elif hasattr(syphon, 'Server'):
+                print("Using Server class")
+                self.server = syphon.Server("ArtNetViz Syphon")
+            else:
+                print("No suitable Syphon server class found")
+                return False
+                
+            print("OpenGL-based Syphon server initialized successfully")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to initialize OpenGL-based Syphon: {e}")
+            self.server = None
+            return False
 
 class MainWindow(QMainWindow):
     """

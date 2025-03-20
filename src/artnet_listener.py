@@ -10,7 +10,7 @@ import numpy as np
 import struct
 import psutil
 import tracemalloc
-from config import DEBUG_MEMORY
+from src.config import DEBUG_MEMORY
 
 class ArtNetPacket:
     """
