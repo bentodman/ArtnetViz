@@ -105,8 +105,22 @@ class CanvasWidget(QWidget):
         self.frame_rate = 44  # Default to DMX standard ~44Hz
         
         # Memory tracking
-        self._last_memory_check = 0
-        self._memory_check_interval = 10  # Check memory every 10 frames
+        self._memory_tracking_enabled = True
+        self._memory_check_interval = 60  # Check memory every 60 frames
+        self._memory_soft_limit_mb = 180  # Perform light cleanup when over this limit
+        self._memory_hard_limit_mb = 220  # Perform aggressive cleanup when over this limit
+        self._memory_critical_limit_mb = 250  # Emergency cleanup when over this limit
+        self._last_memory_usage_mb = 0
+        self._consecutive_high_memory = 0  # Counter for consecutive memory readings above soft limit
+        
+        # Import psutil for memory tracking
+        try:
+            import psutil
+            self._psutil_available = True
+            self._process = psutil.Process()
+        except ImportError:
+            print("Warning: psutil not available, memory tracking disabled")
+            self._psutil_available = False
         
         # Initialize Metal flag
         self.using_metal = False
@@ -350,12 +364,31 @@ class CanvasWidget(QWidget):
                 width = 512
                 height = 10
             
+            # Store the current texture dimensions to avoid unnecessary recreation
+            if not hasattr(self, '_texture_dimensions'):
+                self._texture_dimensions = (0, 0)
+                
             # Check if we already have a valid texture with the correct dimensions
             if (hasattr(self, 'metal_texture') and self.metal_texture and 
-                hasattr(self.metal_texture, 'width') and hasattr(self.metal_texture, 'height') and
-                self.metal_texture.width == width and self.metal_texture.height == height):
+                self._texture_dimensions == (width, height)):
                 # Texture already exists with correct dimensions, no need to recreate
+                if self._frame_counter % 300 == 0:
+                    print(f"Reusing existing texture with dimensions {width}x{height}")
                 return
+            
+            # Only log when actually initializing a new texture
+            print(f"Metal texture initialized successfully with dimensions {width}x{height}")
+            
+            # Store new dimensions
+            self._texture_dimensions = (width, height)
+            
+            # Clean up old texture if it exists
+            if hasattr(self, 'metal_texture') and self.metal_texture:
+                # Release the old texture before creating a new one
+                del self.metal_texture
+                self.metal_texture = None
+                # Force garbage collection
+                gc.collect()
             
             # Create texture descriptor - use correct method for setting properties
             descriptor = Metal.MTLTextureDescriptor.alloc().init()
@@ -371,9 +404,6 @@ class CanvasWidget(QWidget):
             if not self.metal_texture:
                 raise RuntimeError("Failed to create Metal texture")
             
-            # Log success but less frequently to avoid log spam
-            if self._frame_counter % 300 == 0:
-                print(f"Metal texture initialized successfully with dimensions {width}x{height}")
         except Exception as e:
             print(f"Error initializing Metal texture: {e}")
             import traceback
@@ -421,8 +451,137 @@ class CanvasWidget(QWidget):
             self._coordinate_cache[key] = (preview_x, preview_y, preview_size)
         return self._coordinate_cache[key]
 
+    def _check_memory_usage(self):
+        """Check current memory usage and perform cleanup if needed"""
+        if not self._memory_tracking_enabled or not self._psutil_available:
+            return False  # No cleanup performed
+            
+        try:
+            # Get current memory usage
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            self._last_memory_usage_mb = current_usage_mb
+            
+            # Log memory usage periodically
+            if self._frame_counter % 300 == 0:
+                print(f"Memory usage: {current_usage_mb:.2f} MB")
+            
+            # Check if we're over limits
+            cleanup_performed = False
+            
+            if current_usage_mb > self._memory_critical_limit_mb:
+                print(f"CRITICAL: Memory usage ({current_usage_mb:.2f} MB) exceeds critical limit ({self._memory_critical_limit_mb} MB)!")
+                self._perform_emergency_cleanup()
+                cleanup_performed = True
+            elif current_usage_mb > self._memory_hard_limit_mb:
+                print(f"WARNING: Memory usage ({current_usage_mb:.2f} MB) exceeds hard limit ({self._memory_hard_limit_mb} MB)")
+                self._perform_hard_cleanup()
+                cleanup_performed = True
+            elif current_usage_mb > self._memory_soft_limit_mb:
+                # Track consecutive readings over soft limit
+                self._consecutive_high_memory += 1
+                
+                # If memory stays high for several checks, do a light cleanup
+                if self._consecutive_high_memory >= 3:
+                    print(f"NOTICE: Memory usage ({current_usage_mb:.2f} MB) consistently above soft limit ({self._memory_soft_limit_mb} MB)")
+                    self._perform_soft_cleanup()
+                    self._consecutive_high_memory = 0
+                    cleanup_performed = True
+            else:
+                # Reset counter if memory usage is normal
+                self._consecutive_high_memory = 0
+                
+            return cleanup_performed
+            
+        except Exception as e:
+            print(f"Error checking memory usage: {e}")
+            return False
+
+    def _perform_soft_cleanup(self):
+        """Perform a light cleanup to reduce memory usage"""
+        print("Performing soft memory cleanup...")
+        
+        # Clear caches
+        self._color_cache.clear()
+        self._coordinate_cache.clear()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Log memory after cleanup
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            print(f"Memory usage after soft cleanup: {current_usage_mb:.2f} MB")
+
+    def _perform_hard_cleanup(self):
+        """Perform a more aggressive cleanup to reduce memory usage"""
+        print("Performing hard memory cleanup...")
+        
+        # Do everything from soft cleanup
+        self._perform_soft_cleanup()
+        
+        # Recreate any resources that might be holding onto memory
+        if hasattr(self, 'metal_texture') and self.metal_texture:
+            print("Recreating Metal textures...")
+            # Force recreation of texture on next frame
+            del self.metal_texture
+            self.metal_texture = None
+            gc.collect()
+            
+        # Clear pixel buffer completely
+        if hasattr(self, '_pixel_buffer') and self._pixel_buffer is not None:
+            del self._pixel_buffer
+            self._pixel_buffer = None
+            gc.collect()
+            
+        # Log memory after cleanup
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            print(f"Memory usage after hard cleanup: {current_usage_mb:.2f} MB")
+
+    def _perform_emergency_cleanup(self):
+        """Perform emergency cleanup for critical memory situations"""
+        print("EMERGENCY: Performing critical memory cleanup...")
+        
+        # Do hard cleanup first
+        self._perform_hard_cleanup()
+        
+        # Reset anything else that might be using memory
+        # Release all pixmaps and recreate them
+        if hasattr(self, 'pixmap') and self.pixmap:
+            del self.pixmap
+            self.pixmap = None
+        
+        if hasattr(self, 'full_res_pixmap') and self.full_res_pixmap:
+            del self.full_res_pixmap
+            self.full_res_pixmap = None
+        
+        # Force complete GC sweep
+        gc.collect()
+        gc.collect()  # Double collection sometimes helps with reference cycles
+        
+        # Log memory after cleanup
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            print(f"Memory usage after emergency cleanup: {current_usage_mb:.2f} MB")
+            
+            # If still critical, suggest system action
+            if current_usage_mb > self._memory_critical_limit_mb:
+                print("WARNING: Memory still critical after emergency cleanup!")
+                print("Application may need to be restarted externally.")
+
     def update_canvas(self):
         """Update the canvas with the current Art-Net DMX data"""
+        # Periodically check memory usage
+        if self._frame_counter % self._memory_check_interval == 0:
+            cleanup_performed = self._check_memory_usage()
+            if cleanup_performed:
+                # Skip this frame if we just did a cleanup
+                return
+        
         # Get DMX data for all universes
         universes = self.artnet_listener.universes
         universe_count = len(universes)
@@ -446,19 +605,28 @@ class CanvasWidget(QWidget):
             canvas_width = max(self.custom_canvas_width, content_width + self.start_x) if self.custom_canvas_width > 0 else content_width + self.start_x
             canvas_height = max(self.custom_canvas_height, content_height + self.start_y) if self.custom_canvas_height > 0 else content_height + self.start_y
             
-            if self.verbose:
-                print(f"Canvas dimensions: {canvas_width}x{canvas_height}")
+            # Check if we're creating a new pixmap or reusing existing one
+            create_new_pixmap = (
+                self.full_res_pixmap is None or 
+                self.full_res_pixmap.width() != canvas_width or 
+                self.full_res_pixmap.height() != canvas_height
+            )
             
-            # Create or resize the full resolution pixmap for Syphon output
-            if self.full_res_pixmap is None or self.full_res_pixmap.width() != canvas_width or self.full_res_pixmap.height() != canvas_height:
+            # Create or reuse the full resolution pixmap for Syphon output
+            if create_new_pixmap:
+                # Create new pixmap
                 if self.full_res_pixmap is not None:
+                    # Clear old pixmap first to release memory
                     del self.full_res_pixmap
+                    gc.collect()  # Force garbage collection
+                    
                 self.full_res_pixmap = QPixmap(canvas_width, canvas_height)
                 print(f"Created new full-res pixmap: {canvas_width}x{canvas_height}")
             else:
+                # Just clear the existing pixmap
                 self.full_res_pixmap.fill(Qt.GlobalColor.transparent)
             
-            # Check if we need to resize the preview pixmap
+            # Calculate preview dimensions with scaling if needed
             preview_width = canvas_width
             preview_height = canvas_height
             
@@ -469,20 +637,28 @@ class CanvasWidget(QWidget):
                 
                 preview_width = int(preview_width * scale_factor)
                 preview_height = int(preview_height * scale_factor)
-                if self.verbose:
-                    print(f"Preview dimensions scaled to: {preview_width}x{preview_height}")
             
-            # Create or resize the preview pixmap as needed
-            if self.pixmap is None or self.pixmap.width() != preview_width or self.pixmap.height() != preview_height:
+            # Manage preview pixmap
+            create_new_preview = (
+                self.pixmap is None or 
+                self.pixmap.width() != preview_width or 
+                self.pixmap.height() != preview_height
+            )
+            
+            if create_new_preview:
+                # Clear old pixmap first
                 if self.pixmap is not None:
                     del self.pixmap
+                    gc.collect()  # Force garbage collection
+                    
                 self.pixmap = QPixmap(preview_width, preview_height)
             else:
+                # Just clear the existing pixmap
                 self.pixmap.fill(Qt.GlobalColor.transparent)
             
-            # Create local QPainter objects
+            # Create QPainters for both pixmaps
             full_res_painter = QPainter(self.full_res_pixmap)
-            painter = QPainter(self.pixmap)
+            preview_painter = QPainter(self.pixmap)
             
             try:
                 # Draw DMX data
@@ -508,26 +684,20 @@ class CanvasWidget(QWidget):
                         # Draw on both pixmaps
                         full_res_painter.fillRect(pixel_x, row_y, self.pixel_size, self.pixel_size, color)
                         
-                        # Get cached coordinates
+                        # Get cached coordinates for preview
                         preview_x, preview_y, preview_size = self._get_cached_coordinates(
                             pixel_x, row_y, preview_width, canvas_width, preview_height, canvas_height
                         )
                         
-                        painter.fillRect(preview_x, preview_y, preview_size, preview_size, color)
+                        preview_painter.fillRect(preview_x, preview_y, preview_size, preview_size, color)
                 
                 # End painters
                 full_res_painter.end()
-                painter.end()
+                preview_painter.end()
                 
-                # After creating/updating full_res_pixmap, initialize or update Metal texture if needed
-                if self.using_metal and hasattr(self, 'metal_device'):
-                    if not hasattr(self, 'metal_texture') or self.metal_texture is None:
-                        self._init_metal_texture()
-                    elif hasattr(self, 'full_res_pixmap') and self.full_res_pixmap:
-                        # Check if dimensions changed and we need to recreate texture
-                        if (self.full_res_pixmap.width() != self.metal_texture.width or 
-                            self.full_res_pixmap.height() != self.metal_texture.height):
-                            self._init_metal_texture()
+                # Clean up painter objects explicitly
+                del full_res_painter
+                del preview_painter
                 
                 # Update Syphon frame
                 self.update_syphon_frame()
@@ -535,36 +705,42 @@ class CanvasWidget(QWidget):
                 # Force update of the widget
                 self.update()
                 
-                # Periodic cleanup and memory check
+                # Periodic cleanup
                 if self._frame_counter % 60 == 0:
                     # Clear caches periodically to prevent memory growth
                     self._color_cache.clear()
                     self._coordinate_cache.clear()
-                    gc.collect()
                     
-                    # Log memory usage every 60 frames
-                    if DEBUG_MEMORY:
-                        process = psutil.Process()
-                        memory_info = process.memory_info()
-                        memory_mb = memory_info.rss / (1024 * 1024)
-                        print(f"[DEBUG-MEM] Memory usage at frame {self._frame_counter}: {memory_mb:.2f} MB")
-                        if tracemalloc.is_tracing():
-                            snapshot = tracemalloc.take_snapshot()
-                            top_stats = snapshot.statistics('lineno')
-                            print(f"[DEBUG-MEM] Top 5 memory allocations at frame {self._frame_counter}:")
-                            for stat in top_stats[:5]:
-                                print(f"[DEBUG-MEM] {stat}")
+                    # Do a deeper cleanup every minute (60fps * 60 = 3600 frames or 44fps * 60 = 2640 frames)
+                    if self._frame_counter % 3600 == 0 and self._frame_counter > 0:
+                        self._do_major_cleanup()
+            except Exception as e:
+                print(f"Error updating canvas: {e}")
             finally:
-                # Ensure painters are properly cleaned up
-                if full_res_painter.isActive():
+                # Ensure painters are properly cleaned up if exception occurred
+                if 'full_res_painter' in locals() and full_res_painter.isActive():
                     full_res_painter.end()
-                if painter.isActive():
-                    painter.end()
-                del full_res_painter
-                del painter
-                gc.collect()
+                if 'preview_painter' in locals() and preview_painter.isActive():
+                    preview_painter.end()
         elif self.verbose:
             print("No universes found. Canvas not updated.")
+    
+    def _do_major_cleanup(self):
+        """Perform a major cleanup to release memory"""
+        print("Performing major memory cleanup...")
+        
+        # Clear all caches
+        self._color_cache.clear()
+        self._coordinate_cache.clear()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Log memory usage after cleanup
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            print(f"Memory usage after cleanup: {current_usage_mb:.2f} MB")
     
     def _validate_frame_data(self, frame_width, frame_height):
         """Validate frame dimensions and check if there's actual content to display"""
@@ -600,6 +776,10 @@ class CanvasWidget(QWidget):
             return
             
         try:
+            # Skip if application is being closed
+            if not hasattr(self, 'update_timer') or not self.update_timer.isActive():
+                return
+                
             # Check which Syphon implementation we're using
             import syphon
             
@@ -621,56 +801,106 @@ class CanvasWidget(QWidget):
             if not self._validate_frame_data(width, height):
                 return
             
+            # Perform deep memory cleanup every 300 frames (about every 7 seconds at 44fps)
+            if self._frame_counter % 300 == 0 and self._frame_counter > 0:
+                # Perform garbage collection
+                gc.collect()
+                
+                # Log memory usage periodically
+                if self._psutil_available:
+                    mem_info = self._process.memory_info()
+                    current_usage_mb = mem_info.rss / (1024 * 1024)
+                    print(f"Memory usage: {current_usage_mb:.2f} MB")
+            
             # Metal-based Syphon publishing
             if self.using_metal:
                 try:
-                    # Log occasionally
-                    if self._frame_counter % 300 == 0:
-                        print(f"Publishing Metal frame with dimensions: {width}x{height}")
-                    
-                    # Make sure we have a valid texture
-                    if not hasattr(self, 'metal_texture') or self.metal_texture is None:
-                        self._init_metal_texture()
-                    elif (hasattr(self, 'metal_texture') and 
-                          (self.metal_texture.width != width or self.metal_texture.height != height)):
-                        # Dimensions changed, recreate texture
+                    # Make sure we have a valid texture with the correct dimensions
+                    current_dimensions = getattr(self, '_texture_dimensions', (0, 0))
+                    if (not hasattr(self, 'metal_texture') or self.metal_texture is None or
+                        current_dimensions != (width, height)):
+                        # Only log when dimensions change
+                        print(f"Creating new Metal texture with dimensions {width}x{height}")
                         self._init_metal_texture()
                     
                     # Copy pixmap data to metal texture
                     if hasattr(self, 'metal_texture') and self.metal_texture and self.full_res_pixmap:
                         try:
-                            # Convert QPixmap to QImage in RGBA format
+                            # Convert QPixmap to QImage in RGBA format (only once)
                             image = self.full_res_pixmap.toImage()
-                            image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+                            if image.format() != QImage.Format.Format_RGBA8888:
+                                image = image.convertToFormat(QImage.Format.Format_RGBA8888)
                             
-                            # Alternative approach using direct pixel data access
+                            # Use most direct approach possible for copying data
                             import numpy as np
                             from syphon.utils.numpy import copy_image_to_mtl_texture
                             
-                            # Create a numpy array from the QImage using QImage's data access methods
-                            width = image.width()
-                            height = image.height()
+                            # More efficient direct buffer management
+                            # Get access to the raw image data
+                            bytes_per_line = image.bytesPerLine()
+                            bits_ptr = image.constBits()
+                            if bits_ptr:
+                                # Calculate total bytes needed
+                                total_bytes = height * bytes_per_line
+                                
+                                # Set correct size for the buffer view
+                                bits_ptr.setsize(total_bytes)
+                                
+                                # Create a numpy array directly from the QImage memory
+                                buffer = np.frombuffer(bits_ptr, dtype=np.uint8, count=total_bytes)
+                                
+                                # Reshape the buffer to proper dimensions
+                                if bytes_per_line == width * 4:  # Perfect alignment
+                                    # Direct reshape without copying
+                                    pixel_array = buffer.reshape((height, width, 4))
+                                    
+                                    # Copy pixel data to Metal texture
+                                    copy_image_to_mtl_texture(pixel_array, self.metal_texture)
+                                else:
+                                    # With stride handling
+                                    # Make sure we only create the buffer once per size
+                                    if (not hasattr(self, '_pixel_buffer') or 
+                                        self._pixel_buffer is None or 
+                                        self._pixel_buffer.shape != (height, width, 4)):
+                                        # Create a new buffer of the right size
+                                        self._pixel_buffer = np.zeros((height, width, 4), dtype=np.uint8)
+                                    
+                                    # Copy data row by row respecting stride
+                                    for y in range(height):
+                                        row_start = y * bytes_per_line
+                                        row_end = row_start + (width * 4)
+                                        # Make sure we don't go past the buffer end
+                                        if row_end <= total_bytes:
+                                            self._pixel_buffer[y] = buffer[row_start:row_end].reshape(width, 4)
+                                    
+                                    # Copy pixel data to Metal texture
+                                    copy_image_to_mtl_texture(self._pixel_buffer, self.metal_texture)
+                            else:
+                                # If direct buffer access fails, log once per session
+                                if not hasattr(self, '_buffer_access_failed'):
+                                    self._buffer_access_failed = True
+                                    print("Warning: Direct buffer access failed, using fallback method")
+                                    
+                                # Create the buffer once and reuse it
+                                if not hasattr(self, '_pixel_buffer') or self._pixel_buffer is None or self._pixel_buffer.shape != (height, width, 4):
+                                    self._pixel_buffer = np.zeros((height, width, 4), dtype=np.uint8)
+                                
+                                # Pixel-by-pixel copy is slower but more reliable
+                                for y in range(height):
+                                    for x in range(width):
+                                        color = image.pixelColor(x, y)
+                                        self._pixel_buffer[y, x, 0] = color.red()
+                                        self._pixel_buffer[y, x, 1] = color.green()
+                                        self._pixel_buffer[y, x, 2] = color.blue()
+                                        self._pixel_buffer[y, x, 3] = color.alpha()
+                                
+                                # Copy to texture
+                                copy_image_to_mtl_texture(self._pixel_buffer, self.metal_texture)
                             
-                            # Create a numpy array to store the pixel data
-                            pixels = np.zeros((height, width, 4), dtype=np.uint8)
-                            
-                            # Copy pixel data manually
-                            for y in range(height):
-                                for x in range(width):
-                                    color = image.pixelColor(x, y)
-                                    pixels[y, x, 0] = color.red()
-                                    pixels[y, x, 1] = color.green()
-                                    pixels[y, x, 2] = color.blue()
-                                    pixels[y, x, 3] = color.alpha()
-                            
-                            # Copy the numpy array to the metal texture
-                            copy_image_to_mtl_texture(pixels, self.metal_texture)
-                            
-                            # Create a command buffer to publish the texture
+                            # Create a new command buffer for each frame
                             command_buffer = self.metal_command_queue.commandBuffer()
-                            command_buffer.setLabel_("ArtNetViz Publish Command Buffer")
                             
-                            # Publish the texture
+                            # Publish the frame
                             if hasattr(self.server, 'publish_frame_texture'):
                                 self.server.publish_frame_texture(
                                     self.metal_texture,
@@ -678,26 +908,30 @@ class CanvasWidget(QWidget):
                                     command_buffer=command_buffer
                                 )
                                 if self._frame_counter % 300 == 0:
-                                    print("Metal frame published using publish_frame_texture")
-                            elif hasattr(self.server, 'publish'):
-                                # If using newer API, the texture should be automatically published
+                                    print("Frame published using publish_frame_texture")
+                            else:
                                 self.server.publish()
                                 if self._frame_counter % 300 == 0:
-                                    print("Metal frame published using publish()")
-                            else:
-                                if self._frame_counter % 300 == 0:
-                                    print("Metal server lacks publish methods - no frame published")
+                                    print("Frame published using publish()")
                                     
+                            # Force buffer release and cleanup
+                            del command_buffer
+                            
+                            # Clean up local variables explicitly
+                            del buffer
+                            del image
+                            
                         except Exception as e:
-                            print(f"Error copying data to Metal texture: {e}")
-                            import traceback
-                            traceback.print_exc()
+                            if self._frame_counter % 300 == 0:
+                                print(f"Error publishing frame: {e}")
+                                
                 except Exception as e:
-                    print(f"Error copying data to Metal texture: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    if self._frame_counter % 300 == 0:
+                        print(f"Error in Metal publishing: {e}")
+                    
             # OpenGL publishing
             elif not self.using_metal:
+                # OpenGL implementation similar to before...
                 if self.full_res_pixmap and not self.full_res_pixmap.isNull():
                     # Convert QPixmap to QImage
                     image = self.full_res_pixmap.toImage()
@@ -711,54 +945,53 @@ class CanvasWidget(QWidget):
                             width = size.width()
                             height = size.height()
                             
-                            # Try the NSImage approach - simplify to focus on just this method which is most likely to work
-                            published = False
+                            # Try the NSImage approach
                             ns_image = self._qimage_to_nsimage(image)
                             if ns_image is not None:
-                                # Try publishImage_ first (Objective-C style) then fallback to others
-                                try:
-                                    if hasattr(self.server, 'publishImage_'):
-                                        self.server.publishImage_(ns_image)
-                                        published = True
-                                        if self._frame_counter % 300 == 0:
-                                            print("Published using publishImage_ method")
-                                    elif hasattr(self.server, 'publish_frame_image'):
-                                        self.server.publish_frame_image(ns_image)
-                                        published = True
-                                        if self._frame_counter % 300 == 0:
-                                            print("Published using publish_frame_image method")
-                                    elif hasattr(self.server, 'publish_image'):
-                                        self.server.publish_image(ns_image)
-                                        published = True
-                                        if self._frame_counter % 300 == 0:
-                                            print("Published using publish_image method")
-                                    elif hasattr(self.server, 'publish_nsimage'):
-                                        self.server.publish_nsimage(ns_image)
-                                        published = True
-                                        if self._frame_counter % 300 == 0:
-                                            print("Published using publish_nsimage method")
-                                    elif hasattr(self.server, 'publish_texture'):
-                                        self.server.publish_texture(ns_image)
-                                        published = True
-                                        if self._frame_counter % 300 == 0:
-                                            print("Published using publish_texture method")
+                                # Try available publishing methods
+                                published = False
+                                if hasattr(self.server, 'publishImage_'):
+                                    self.server.publishImage_(ns_image)
+                                    published = True
+                                elif hasattr(self.server, 'publish_frame_image'):
+                                    self.server.publish_frame_image(ns_image)
+                                    published = True
+                                elif hasattr(self.server, 'publish_image'):
+                                    self.server.publish_image(ns_image)
+                                    published = True
+                                elif hasattr(self.server, 'publish_nsimage'):
+                                    self.server.publish_nsimage(ns_image)
+                                    published = True
+                                elif hasattr(self.server, 'publish_texture'):
+                                    self.server.publish_texture(ns_image)
+                                    published = True
+                                
+                                # Log occasionally
+                                if published and self._frame_counter % 300 == 0:
+                                    print(f"NSImage published: {width}x{height}")
                                     
-                                    # If we successfully published, log it once but don't log every frame
-                                    if published and (self._frame_counter % 300 == 0):
-                                        print(f"Successfully published NSImage to Syphon: {width}x{height}")
-                                except Exception as e:
-                                    print(f"NSImage publishing failed: {e}")
-                                    import traceback
-                                    traceback.print_exc()
+                                # Clean up explicitly
+                                del ns_image
+                            else:
+                                if self._frame_counter % 300 == 0:
+                                    print("Failed to create NSImage")
+                                    
+                            # Clean up explicitly
+                            del image
+                                    
                         except Exception as e:
-                            print(f"Error in Syphon publishing: {str(e)}")
-                            import traceback
-                            traceback.print_exc()
+                            if self._frame_counter % 300 == 0:
+                                print(f"Error in OpenGL publishing: {e}")
+                                
         except Exception as e:
-            print(f"Error in update_syphon_frame: {str(e)}")
-            import traceback
-            traceback.print_exc()
-    
+            if self._frame_counter % 300 == 0:
+                print(f"Error in update_syphon_frame: {e}")
+                
+        # Perform limited cleanup after each frame
+        if self._frame_counter % 10 == 0:
+            # Explicitly call garbage collection
+            gc.collect()
+
     def paintEvent(self, event):
         """Paint the canvas on the widget"""
         if self.pixmap:
@@ -807,6 +1040,8 @@ class CanvasWidget(QWidget):
     def cleanup(self):
         """Clean up resources"""
         try:
+            print("Starting full application cleanup...")
+            
             # Stop the update timer
             if hasattr(self, 'update_timer') and self.update_timer:
                 self.update_timer.stop()
@@ -814,6 +1049,7 @@ class CanvasWidget(QWidget):
             # Clean up Syphon resources
             if hasattr(self, 'server') and self.server:
                 try:
+                    print("Stopping Syphon server...")
                     self.server.stop()
                 except Exception as e:
                     print(f"Error stopping Syphon server: {e}")
@@ -822,6 +1058,19 @@ class CanvasWidget(QWidget):
             
             # Clean up Metal resources
             if self.using_metal:
+                print("Cleaning up Metal resources...")
+                # Clear texture dimensions
+                if hasattr(self, '_texture_dimensions'):
+                    self._texture_dimensions = (0, 0)
+                        
+                if hasattr(self, '_pixel_buffer') and self._pixel_buffer is not None:
+                    try:
+                        del self._pixel_buffer
+                    except Exception as e:
+                        print(f"Error cleaning up pixel buffer: {e}")
+                    finally:
+                        self._pixel_buffer = None
+                
                 if hasattr(self, 'metal_texture') and self.metal_texture:
                     try:
                         del self.metal_texture
@@ -847,6 +1096,7 @@ class CanvasWidget(QWidget):
                         self.metal_device = None
             
             # Clean up pixmaps
+            print("Cleaning up pixmaps...")
             if hasattr(self, 'pixmap') and self.pixmap:
                 try:
                     del self.pixmap
@@ -881,6 +1131,7 @@ class CanvasWidget(QWidget):
                     self._full_res_painter = None
             
             # Clean up caches
+            print("Cleaning up caches...")
             if hasattr(self, '_color_cache'):
                 self._color_cache.clear()
             if hasattr(self, '_coordinate_cache'):
@@ -893,7 +1144,16 @@ class CanvasWidget(QWidget):
                 self._syphon_array_dims = None
             
             # Force garbage collection
+            print("Forcing final garbage collection...")
             gc.collect()
+            
+            # Final memory report
+            if self._psutil_available:
+                mem_info = self._process.memory_info()
+                current_usage_mb = mem_info.rss / (1024 * 1024)
+                print(f"Final memory usage: {current_usage_mb:.2f} MB")
+            
+            print("Cleanup completed")
             
         except Exception as e:
             print(f"Error during cleanup: {e}")

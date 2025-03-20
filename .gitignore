@@ -69,6 +69,7 @@ Icon
 build_*/
 dist_*/
 *.log
+*.csv
 .cursor/
 recordings/
 
