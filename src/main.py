@@ -101,17 +101,15 @@ class CanvasWidget(QWidget):
                  canvas_width=0, canvas_height=0, start_x=0, start_y=0, parent=None):
         super().__init__(parent)
         
-        # Store the Art-Net listener
+        # Initialize variables
         self.artnet_listener = artnet_listener
-        
-        # Store visualization parameters
         self.pixel_size = pixel_size
         self.gap_x = gap_x
         self.gap_y = gap_y
-        self.custom_canvas_width = canvas_width
-        self.custom_canvas_height = canvas_height
         self.start_x = start_x
         self.start_y = start_y
+        self.custom_canvas_width = canvas_width
+        self.custom_canvas_height = canvas_height
         
         # Logging control
         self.verbose = False
@@ -140,6 +138,33 @@ class CanvasWidget(QWidget):
         # Initialize Metal flag
         self.using_metal = False
         
+        # Texture pool management
+        self._texture_pool = {}  # Format: {(width, height): [available_textures]}
+        self._max_pool_size = 1  # Maximum number of textures to keep in the pool per size (reduced)
+        self._texture_in_use = None  # Currently active texture
+        self._texture_tracker = {}  # Track all textures created by this instance for leak detection
+        self._total_textures_created = 0
+        self._total_textures_released = 0
+        self._last_pool_reset = 0  # Track when we last reset the pool
+        self._last_texture_recreation = 0  # Track when we last recreated the texture
+        self._last_syphon_restart = 0  # Track when we last restarted the Syphon server
+        self._debug_memory = True  # Enable more verbose memory debugging
+        
+        # Cache for color objects
+        self._color_cache = {}
+        
+        # Cache for coordinate calculations
+        self._coordinate_cache = {}
+        
+        # Cache for Syphon frame data
+        self._syphon_array = None
+        self._syphon_array_dims = None
+        
+        # Numpy array pool for pixel data
+        self._array_pool = {}  # Format: {(height, width, channels): [arrays]}
+        self._max_array_pool_size = 3  # Maximum arrays to keep per size
+        self._array_in_use = {}  # Currently in-use arrays
+        
         # Initialize Syphon
         self.init_syphon()
         
@@ -149,19 +174,7 @@ class CanvasWidget(QWidget):
         # Show detailed server information
         self._show_syphon_info()
         
-        # Create canvas update timer
-        self.update_timer = QTimer(self)
-        self.update_timer.timeout.connect(self.update_canvas)
-        self.set_frame_rate(self.frame_rate)
-        
-        # Set up the widget
-        self.setMinimumSize(100, 100)
-        self.setSizePolicy(
-            QSizePolicy.Policy.Expanding, 
-            QSizePolicy.Policy.Expanding
-        )
-        
-        # Initialize the pixmaps
+        # Initialize pixmaps
         self.pixmap = None  # Scaled pixmap for preview
         self.full_res_pixmap = None  # Full-resolution pixmap for Syphon output
         self.max_preview_width = 1200  # Maximum width for the preview window
@@ -174,116 +187,151 @@ class CanvasWidget(QWidget):
         # Frame counter for periodic cleanup
         self._frame_counter = 0
         
-        # Cache for color objects
-        self._color_cache = {}
+        # Set up the widget
+        self.setMinimumSize(100, 100)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, 
+            QSizePolicy.Policy.Expanding
+        )
         
-        # Cache for coordinate calculations
-        self._coordinate_cache = {}
+        # Create two timers - one for canvas updates and one for Syphon
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.update_canvas)
         
-        # Cache for Syphon frame data
-        self._syphon_array = None
-        self._syphon_array_dims = None
+        # Create Syphon update timer only if we have a server
+        if hasattr(self, 'server') and self.server:
+            self.syphon_timer = QTimer(self)
+            self.syphon_timer.timeout.connect(self.update_syphon_frame)
+            self.syphon_timer.setTimerType(Qt.TimerType.PreciseTimer)
         
+        # Configure timers with frame rate
+        self.set_frame_rate(self.frame_rate)
+        
+        # Update initial canvas
         self.update_canvas()
 
     def init_syphon(self):
-        """Initialize Syphon server for frame sharing"""
+        """Initialize Syphon client for GPU-accelerated frame publishing"""
         try:
-            # Import Syphon
             import syphon
             
-            # Initialize _objc_utils regardless of Syphon mode
-            self._objc_utils = None
-            self._init_ns_image_converter()
+            # Store whether we have Syphon available
+            self.syphon_available = True
+            self.server = None  # Will be set if server creation succeeds
+            self.using_metal = False  # Will be set to True if Metal is available
             
-            # Detect which Syphon implementation is being used
-            print(f"Syphon module found: {syphon.__name__}")
-            print(f"Syphon version: {getattr(syphon, '__version__', 'unknown')}")
-            print(f"Available Syphon attributes: {dir(syphon)}")
+            # Check for various Syphon implementations
+            self._check_syphon_methods()
             
-            # Try to use Metal first
+            # Try Metal-based Syphon first (preferred)
             if hasattr(syphon, 'SyphonMetalServer'):
-                print("Attempting to use syphon-python Metal implementation")
                 try:
+                    # Import needed libraries
+                    import objc
                     import Metal
+                    import syphon.utils.numpy
+                    
+                    # Create Metal device
                     self.metal_device = Metal.MTLCreateSystemDefaultDevice()
                     if not self.metal_device:
-                        print("No Metal device available, will try OpenGL")
-                        raise ImportError("Metal device not available")
+                        raise RuntimeError("Could not create Metal device")
                     
                     # Create command queue
                     self.metal_command_queue = self.metal_device.newCommandQueue()
                     if not self.metal_command_queue:
-                        print("Failed to create Metal command queue")
-                        raise ImportError("Metal command queue creation failed")
+                        raise RuntimeError("Could not create Metal command queue")
                     
-                    # Create Metal server
-                    self.server = syphon.SyphonMetalServer("ArtNetViz Syphon", 
-                                                          device=self.metal_device, 
-                                                          command_queue=self.metal_command_queue)
+                    # Create server with Metal backend
+                    self.server = syphon.SyphonMetalServer("ArtNetViz Syphon",
+                                                      self.metal_device,
+                                                      self.metal_command_queue)
+                    if not self.server:
+                        raise RuntimeError("Could not create Syphon Metal server")
                     
-                    # Test if the server is working
-                    if hasattr(self.server, 'publish'):
-                        try:
-                            self.server.publish()
-                            print("Metal server publish test passed")
-                            self.using_metal = True
-                            print("Metal-based Syphon server initialized successfully")
-                        except Exception as e:
-                            print(f"Metal server publish test failed: {e}")
-                            raise ImportError("Metal server publish test failed")
-                    else:
-                        print("Metal server lacks publish method")
-                        raise ImportError("Metal server lacks required methods")
+                    # Set flag to indicate we're using Metal
+                    self.using_metal = True
+                    
+                    print(f"Metal-based Syphon server initialized")
+                    # Record the available methods on this server
+                    if self.server:
+                        method_list = [method for method in dir(self.server) if not method.startswith('_')]
+                        print(f"Available server methods: {', '.join(method_list[:10])}...")
                         
-                except (ImportError, AttributeError, Exception) as e:
-                    print(f"Metal initialization failed: {str(e)}")
-                    print("Will try OpenGL next")
-                    self.using_metal = False
-                    self.server = None
-            
-            # Try OpenGL if Metal failed or wasn't available
-            if not self.server and hasattr(syphon, 'SyphonOpenGLServer'):
-                print("Attempting to use syphon-python OpenGL implementation")
-                try:
-                    self.server = syphon.SyphonOpenGLServer("ArtNetViz Syphon")
-                    self.using_metal = False
-                    print("OpenGL-based Syphon server initialized")
                 except Exception as e:
-                    print(f"OpenGL Syphon initialization failed: {e}")
-                    self.server = None
+                    import traceback
+                    traceback.print_exc()
+                    print(f"Failed to initialize Metal-based Syphon: {e}")
+                    # Fall back to OpenGL-based Syphon
+                    self.using_metal = False
             
-            # If we couldn't initialize either Metal or OpenGL properly, disable Syphon
-            if not self.server:
-                print("Could not initialize any Syphon server implementation")
-                raise ImportError("No suitable Syphon server implementation")
+            # Fall back to OpenGL-based Syphon if Metal isn't available
+            if not self.using_metal:
+                try:
+                    # Initialize NSImage conversion
+                    self._init_ns_image_converter()
+                    
+                    # Try legacy OpenGL-based Syphon classes
+                    if hasattr(syphon, 'SyphonServer'):
+                        print("Using legacy SyphonServer class")
+                        self.server = syphon.SyphonServer("ArtNetViz Syphon")
+                    elif hasattr(syphon, 'Server'):
+                        print("Using Server class")
+                        self.server = syphon.Server("ArtNetViz Syphon")
+                    else:
+                        print("No suitable Syphon server class found")
+                except Exception as e:
+                    print(f"Failed to initialize OpenGL-based Syphon: {e}")
             
-            # Initialize array for direct numpy publishing
-            self._syphon_array = None
-            self._syphon_array_dims = None
+            # NOTE: We don't initialize the update timer here anymore,
+            # it should be created by the CanvasWidget constructor and updated
+            # by set_frame_rate
+                
+            print("Syphon server initialized successfully")
+            print(f"Using Metal: {self.using_metal}")
             
-            # Log available methods for debugging
-            self._check_syphon_methods()
-            
-            # Show detailed server information
-            self._show_syphon_info()
-            
-        except ImportError as e:
-            print(f"Syphon not available - sharing disabled: {str(e)}")
-            self.server = None
-            self.using_metal = False
+        except ImportError:
+            self.syphon_available = False
+            print("Syphon module not available. Install 'syphon' package for Syphon support.")
         except Exception as e:
-            print(f"Error initializing Syphon: {str(e)}")
-            self.server = None
-            self.using_metal = False
-            
-        # Log available methods for debugging
-        if self.server is not None:
-            self._check_syphon_methods()
-            
-            # Show detailed server information
-            self._show_syphon_info()
-  
+            self.syphon_available = False
+            print(f"Error initializing Syphon: {e}")
+
+    def _init_update_timer(self):
+        """Initialize the update timer with proper cleanup handling"""
+        # Make sure any existing timer is cleaned up first
+        self._cleanup_timer()
+        
+        # Create a new timer
+        self.update_timer = QTimer()
+        self.update_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        
+        # Set default frame rate
+        self.set_frame_rate(self.frame_rate)
+        
+        # Connect using a direct connection that will be properly cleaned up
+        self.update_timer.timeout.connect(self.update_syphon_frame)
+        
+        # Start the timer
+        self.update_timer.start()
+        
+    def _cleanup_timer(self):
+        """Safely clean up the update timer"""
+        if hasattr(self, 'update_timer') and self.update_timer:
+            try:
+                # Stop the timer
+                self.update_timer.stop()
+                
+                # Disconnect all connections
+                try:
+                    if hasattr(self.update_timer, 'timeout'):
+                        self.update_timer.timeout.disconnect()
+                except Exception as e:
+                    print(f"Error disconnecting timer signals: {e}")
+            except Exception as e:
+                print(f"Error cleaning up timer: {e}")
+                import traceback
+                traceback.print_exc()
+
     def _init_ns_image_converter(self):
         """Initialize the NSImage converter for OpenGL mode"""
         try:
@@ -366,72 +414,181 @@ class CanvasWidget(QWidget):
             return None
 
     def _init_metal_texture(self):
-        """Initialize the Metal texture for Syphon output"""
-        if not self.using_metal or not hasattr(self, 'metal_device'):
+        """Initialize a Metal texture for Syphon frame publishing"""
+        if not self.using_metal:
             return
             
+        from Foundation import NSAutoreleasePool
+        
+        # Create an autorelease pool for texture creation
+        pool = NSAutoreleasePool.alloc().init()
+        
         try:
-            # Get the actual dimensions - use default if pixmap not yet created
-            if hasattr(self, 'full_res_pixmap') and self.full_res_pixmap and not self.full_res_pixmap.isNull():
+            # Get the dimensions for the texture
+            if self.full_res_pixmap and not self.full_res_pixmap.isNull():
                 width = self.full_res_pixmap.width()
                 height = self.full_res_pixmap.height()
             else:
+                # Default dimensions if no pixmap exists
                 width = 512
                 height = 10
-            
-            # Store the current texture dimensions to avoid unnecessary recreation
-            if not hasattr(self, '_texture_dimensions'):
-                self._texture_dimensions = (0, 0)
                 
-            # Check if we already have a valid texture with the correct dimensions
-            if (hasattr(self, 'metal_texture') and self.metal_texture and 
-                self._texture_dimensions == (width, height)):
-                # Texture already exists with correct dimensions, no need to recreate
-                if self._frame_counter % 300 == 0:
-                    print(f"Reusing existing texture with dimensions {width}x{height}")
+            # Skip if dimensions are invalid
+            if width <= 0 or height <= 0:
+                print(f"Invalid texture dimensions: {width}x{height}")
                 return
+                
+            # Check if we already have a valid texture with these dimensions
+            if (hasattr(self, 'metal_texture') and self.metal_texture is not None and 
+                hasattr(self, '_texture_dimensions') and self._texture_dimensions == (width, height)):
+                # Already have a valid texture, skip recreation
+                return
+                
+            # Check if we have a previously created texture with the same dimensions in the pool
+            if (width, height) in self._texture_pool and self._texture_pool[(width, height)]:
+                # Reuse a texture from the pool
+                self.metal_texture = self._texture_pool[(width, height)].pop()
+                texture_id = id(self.metal_texture)
+                if self._debug_memory:
+                    print(f"Reusing texture {texture_id} from pool for dimensions {width}x{height}")
+                
+                # Update dimensions
+                self._texture_dimensions = (width, height)
+                
+                # Update tracker
+                if texture_id in self._texture_tracker:
+                    self._texture_tracker[texture_id]['last_used'] = self._frame_counter
+                else:
+                    # Re-register if not in tracker
+                    self._texture_tracker[texture_id] = {
+                        'size': (width, height),
+                        'created_at': self._frame_counter,
+                        'last_used': self._frame_counter
+                    }
+                    
+                # Return early since we found a texture
+                return
+                
+            # Before creating a new texture, release the old one properly
+            if hasattr(self, 'metal_texture') and self.metal_texture is not None:
+                # Get the current texture's dimensions for potential reuse
+                old_dimensions = getattr(self, '_texture_dimensions', (0, 0))
+                
+                # Only add to pool if it's a different size (otherwise we'd be adding and removing the same size)
+                if old_dimensions != (width, height):
+                    self._return_texture_to_pool(self.metal_texture, old_dimensions)
+                else:
+                    # If same size, just release it
+                    self._safely_release_texture(self.metal_texture)
+                
+                # Clear the reference
+                self.metal_texture = None
             
-            # Only log when actually initializing a new texture
-            print(f"Metal texture initialized successfully with dimensions {width}x{height}")
-            
-            # Store new dimensions
+            # Store dimensions for future reference
             self._texture_dimensions = (width, height)
             
-            # Clean up old texture if it exists
-            if hasattr(self, 'metal_texture') and self.metal_texture:
-                # Release the old texture before creating a new one
-                del self.metal_texture
-                self.metal_texture = None
-                # Force garbage collection
-                gc.collect()
+            # Create texture descriptor
+            import Metal
+            descriptor = Metal.MTLTextureDescriptor.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
+                Metal.MTLPixelFormatBGRA8Unorm,
+                width,
+                height,
+                False
+            )
             
-            # Create texture descriptor - use correct method for setting properties
-            descriptor = Metal.MTLTextureDescriptor.alloc().init()
-            # Use setPixelFormat_ instead of direct assignment
-            descriptor.setPixelFormat_(80)  # BGRA8Unorm = 80 in Metal
-            descriptor.setWidth_(width)
-            descriptor.setHeight_(height)
-            descriptor.setMipmapLevelCount_(1)
-            descriptor.setUsage_(7)  # renderTarget(1) | shaderRead(2) | shaderWrite(4) = 7
+            # Configure texture usage
+            descriptor.setUsage_(Metal.MTLTextureUsageShaderRead | Metal.MTLTextureUsageRenderTarget)
             
-            # Create texture
+            # Create the texture
             self.metal_texture = self.metal_device.newTextureWithDescriptor_(descriptor)
+            
             if not self.metal_texture:
-                raise RuntimeError("Failed to create Metal texture")
+                print(f"Failed to create Metal texture with dimensions {width}x{height}")
+                return
+                
+            # Set a label for debugging
+            self.metal_texture.setLabel_(f"ArtNetViz_Texture_{width}x{height}")
+            
+            # Register in texture tracker
+            texture_id = id(self.metal_texture)
+            self._texture_tracker[texture_id] = {
+                'size': (width, height),
+                'created_at': self._frame_counter,
+                'last_used': self._frame_counter
+            }
+            
+            self._total_textures_created += 1
+            
+            if self._debug_memory:
+                print(f"Created new Metal texture {texture_id} with dimensions {width}x{height}")
+                print(f"Total textures: created={self._total_textures_created}, released={self._total_textures_released}")
             
         except Exception as e:
             print(f"Error initializing Metal texture: {e}")
-            import traceback
-            traceback.print_exc()
             if hasattr(self, 'metal_texture'):
-                del self.metal_texture
-            self.metal_texture = None
-            # Fall back to legacy mode
-            self.using_metal = False
-            if hasattr(self, 'metal_device'):
-                del self.metal_device
-            if hasattr(self, 'metal_command_queue'):
-                del self.metal_command_queue
+                self.metal_texture = None
+        finally:
+            # Release autorelease pool
+            del pool
+
+    def _safely_release_texture(self, texture, from_pool=False):
+        """Safely release a Metal texture."""
+        from Foundation import NSAutoreleasePool
+        import objc
+        
+        # Create an autorelease pool for texture release
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            # Only attempt to release if texture exists
+            if texture is not None:
+                texture_id = id(texture)
+                
+                # Check if texture is tracked
+                is_tracked = texture_id in self._texture_tracker
+                
+                # Print verbose info
+                if self._debug_memory:
+                    print(f"Releasing texture {texture_id} - was in pool: {from_pool}, was tracked: {is_tracked}")
+                
+                # Check if texture is still in any pool and remove it
+                if from_pool == False:  # Only check if not already releasing from pool
+                    for size, textures in list(self._texture_pool.items()):
+                        for i, pooled_texture in enumerate(textures):
+                            if id(pooled_texture) == texture_id:
+                                # Found in pool, remove it
+                                textures.pop(i)
+                                if self._debug_memory:
+                                    print(f"Removed texture {texture_id} from pool during release")
+                                break
+                
+                # Remove from tracker
+                if is_tracked:
+                    self._texture_tracker.pop(texture_id, None)
+                    
+                # Force release by explicitly nullifying all references and calling garbage collection
+                if hasattr(texture, 'release'):
+                    # If the texture has a release method, call it
+                    try:
+                        texture.release()
+                    except Exception as e:
+                        if self._debug_memory:
+                            print(f"Error calling release on texture: {e}")
+                
+                # Set to None to release Python reference
+                texture = None
+                
+                # Increment counter
+                self._total_textures_released += 1
+                
+                # Force a garbage collection cycle if we're releasing many textures at once
+                if self._total_textures_released % 10 == 0:
+                    gc.collect()
+        except Exception as e:
+            print(f"Error releasing texture: {e}")
+        
+        # Release autorelease pool
+        del pool
 
     def set_frame_rate(self, fps):
         """Set the frame rate for canvas updates"""
@@ -439,13 +596,23 @@ class CanvasWidget(QWidget):
         # Calculate timer interval in milliseconds (1000ms / fps)
         interval_ms = int(1000 / fps) if fps > 0 else 1000
         
-        # Stop the timer if it's running
-        if self.update_timer.isActive():
-            self.update_timer.stop()
-            
-        # Set the new interval and restart
-        self.update_timer.setInterval(interval_ms)
-        self.update_timer.start()
+        # Update canvas timer interval if timer exists
+        if hasattr(self, 'update_timer') and self.update_timer:
+            try:
+                self.update_timer.setInterval(interval_ms)
+                if not self.update_timer.isActive():
+                    self.update_timer.start()
+            except Exception as e:
+                print(f"Error updating canvas timer interval: {e}")
+        
+        # Update Syphon timer interval if it exists
+        if hasattr(self, 'syphon_timer') and self.syphon_timer:
+            try:
+                self.syphon_timer.setInterval(interval_ms)
+                if not self.syphon_timer.isActive():
+                    self.syphon_timer.start()
+            except Exception as e:
+                print(f"Error updating Syphon timer interval: {e}")
         
         if self.verbose:
             print(f"Frame rate set to {fps} FPS (interval: {interval_ms}ms)")
@@ -487,10 +654,26 @@ class CanvasWidget(QWidget):
             if current_usage_mb > self._memory_critical_limit_mb:
                 print(f"CRITICAL: Memory usage ({current_usage_mb:.2f} MB) exceeds critical limit ({self._memory_critical_limit_mb} MB)!")
                 self._perform_emergency_cleanup()
+                
+                # If we're still extremely high after emergency cleanup, restart the Syphon server
+                if self._get_memory_usage_mb() > self._memory_critical_limit_mb * 0.9:
+                    # Check if we haven't restarted too recently
+                    if self._frame_counter - self._last_syphon_restart > 1000:  # About 22 seconds at 44fps
+                        print("Memory still critical after cleanup, forcing Syphon server restart...")
+                        self._restart_syphon_server()
+                
                 cleanup_performed = True
             elif current_usage_mb > self._memory_hard_limit_mb:
                 print(f"WARNING: Memory usage ({current_usage_mb:.2f} MB) exceeds hard limit ({self._memory_hard_limit_mb} MB)")
                 self._perform_hard_cleanup()
+                
+                # If memory is still high after hard cleanup, consider restarting Syphon
+                if self._get_memory_usage_mb() > self._memory_hard_limit_mb * 0.9:
+                    # Check if we haven't restarted too recently
+                    if self._frame_counter - self._last_syphon_restart > 2000:  # About 45 seconds at 44fps
+                        print("Memory still high after hard cleanup, restarting Syphon server...")
+                        self._restart_syphon_server()
+                
                 cleanup_performed = True
             elif current_usage_mb > self._memory_soft_limit_mb:
                 # Track consecutive readings over soft limit
@@ -500,7 +683,17 @@ class CanvasWidget(QWidget):
                 if self._consecutive_high_memory >= 3:
                     print(f"NOTICE: Memory usage ({current_usage_mb:.2f} MB) consistently above soft limit ({self._memory_soft_limit_mb} MB)")
                     self._perform_soft_cleanup()
-                    self._consecutive_high_memory = 0
+                    
+                    # If we've had many consecutive high memory readings, force texture recreation
+                    if self._consecutive_high_memory >= 5:
+                        self._force_texture_recreation()
+                    
+                    # If memory remains consistently high for a long time, consider Syphon restart
+                    if self._consecutive_high_memory >= 10 and self._frame_counter - self._last_syphon_restart > 3000:
+                        print("Memory consistently high for extended period, restarting Syphon server...")
+                        self._restart_syphon_server()
+                    
+                    self._consecutive_high_memory = 0  # Reset after taking action
                     cleanup_performed = True
             else:
                 # Reset counter if memory usage is normal
@@ -516,283 +709,598 @@ class CanvasWidget(QWidget):
         """Perform a light cleanup to reduce memory usage"""
         print("Performing soft memory cleanup...")
         
-        # Clear caches
-        self._color_cache.clear()
-        self._coordinate_cache.clear()
-        
-        # Force garbage collection
+        # Clear color cache
+        if hasattr(self, '_color_cache'):
+            self._color_cache.clear()
+            
+        # Clear coordinate cache
+        if hasattr(self, '_coordinate_cache'):
+            self._coordinate_cache.clear()
+            
+        # Trim array pool
+        if hasattr(self, '_array_pool'):
+            self._trim_array_pool()
+            
+        # Trigger garbage collection
         gc.collect()
         
-        # Log memory after cleanup
+        # Print memory status
         if self._psutil_available:
-            mem_info = self._process.memory_info()
-            current_usage_mb = mem_info.rss / (1024 * 1024)
+            current_usage_mb = self._get_memory_usage_mb()
             print(f"Memory usage after soft cleanup: {current_usage_mb:.2f} MB")
-
+    
     def _perform_hard_cleanup(self):
-        """Perform a more aggressive cleanup to reduce memory usage"""
+        """Perform aggressive cleanup to reduce memory usage"""
         print("Performing hard memory cleanup...")
         
-        # Do everything from soft cleanup
+        # First do a soft cleanup
         self._perform_soft_cleanup()
         
-        # Recreate any resources that might be holding onto memory
-        if hasattr(self, 'metal_texture') and self.metal_texture:
-            print("Recreating Metal textures...")
-            # Force recreation of texture on next frame
-            del self.metal_texture
-            self.metal_texture = None
-            gc.collect()
+        # Then do more aggressive cleanup:
+        
+        # Trim the texture pool more aggressively
+        print("Trimming texture pool...")
+        
+        # If we have a texture pool, reduce its size
+        if hasattr(self, '_texture_pool') and self._texture_pool:
+            # Count before
+            total_before = sum(len(textures) for textures in self._texture_pool.values())
             
-        # Clear pixel buffer completely
-        if hasattr(self, '_pixel_buffer') and self._pixel_buffer is not None:
-            del self._pixel_buffer
-            self._pixel_buffer = None
-            gc.collect()
+            # Drop all but the most recently used texture from each pool
+            for size, textures in list(self._texture_pool.items()):
+                while len(textures) > 1:  # Keep only 1 per size
+                    texture = textures.pop(0)
+                    self._safely_release_texture(texture, from_pool=True)
             
-        # Log memory after cleanup
+            # Count after
+            total_after = sum(len(textures) for textures in self._texture_pool.values())
+            print(f"Reduced texture pool from {total_before} to {total_after} textures")
+        
+        # Clear all array pools
+        if hasattr(self, '_array_pool') and self._array_pool:
+            count = sum(len(arrays) for arrays in self._array_pool.values())
+            print(f"Clearing {count} arrays from pool")
+            self._cleanup_array_pool()
+        
+        # Force texture recreation
+        self._force_texture_recreation()
+        
+        # Run full garbage collection
+        print("Running full garbage collection...")
+        import gc
+        gc.collect()
+        
+        # Check if we need to restart Syphon server (if memory is still high and last restart was a while ago)
+        mem_usage = self._get_memory_usage_mb()
+        if mem_usage > self._memory_hard_limit_mb and self._frame_counter - self._last_syphon_restart > 3000:
+            self._restart_syphon_server()
+        
+        # Print memory status
         if self._psutil_available:
             mem_info = self._process.memory_info()
             current_usage_mb = mem_info.rss / (1024 * 1024)
             print(f"Memory usage after hard cleanup: {current_usage_mb:.2f} MB")
-
+    
     def _perform_emergency_cleanup(self):
-        """Perform emergency cleanup for critical memory situations"""
-        print("EMERGENCY: Performing critical memory cleanup...")
+        """Emergency cleanup when memory usage is critical"""
+        print("!!!! EMERGENCY MEMORY CLEANUP TRIGGERED !!!!")
         
-        # Do hard cleanup first
+        # First try other cleanup methods
         self._perform_hard_cleanup()
         
-        # Reset anything else that might be using memory
-        # Release all pixmaps and recreate them
-        if hasattr(self, 'pixmap') and self.pixmap:
-            del self.pixmap
-            self.pixmap = None
+        # Force release of ALL resources
+        import gc
         
-        if hasattr(self, 'full_res_pixmap') and self.full_res_pixmap:
-            del self.full_res_pixmap
-            self.full_res_pixmap = None
+        # Create an autorelease pool for the emergency cleanup
+        from Foundation import NSAutoreleasePool
+        pool = NSAutoreleasePool.alloc().init()
         
-        # Force complete GC sweep
-        gc.collect()
-        gc.collect()  # Double collection sometimes helps with reference cycles
-        
-        # Log memory after cleanup
-        if self._psutil_available:
-            mem_info = self._process.memory_info()
-            current_usage_mb = mem_info.rss / (1024 * 1024)
-            print(f"Memory usage after emergency cleanup: {current_usage_mb:.2f} MB")
+        try:
+            # Completely reset the texture pool
+            self._reset_texture_pool("Emergency cleanup")
             
-            # If still critical, suggest system action
-            if current_usage_mb > self._memory_critical_limit_mb:
-                print("WARNING: Memory still critical after emergency cleanup!")
-                print("Application may need to be restarted externally.")
-
-    def update_canvas(self):
-        """Update the canvas with the current Art-Net DMX data"""
-        # Periodically check memory usage
-        if self._frame_counter % self._memory_check_interval == 0:
-            cleanup_performed = self._check_memory_usage()
-            if cleanup_performed:
-                # Skip this frame if we just did a cleanup
-                return
-        
-        # Get DMX data for all universes
-        universes = self.artnet_listener.universes
-        universe_count = len(universes)
-        
-        if self.verbose:
-            print(f"Updating canvas with {universe_count} universes")
-        
-        if universe_count > 0:
-            # Calculate canvas dimensions based on visualization parameters
-            dmx_width = 512
+            # Force texture recreation
+            self._force_texture_recreation()
             
-            # Calculate pixel dimensions including gaps
-            pixel_width_with_gap = self.pixel_size + self.gap_x
-            pixel_height_with_gap = self.pixel_size + self.gap_y
+            # Complete reset of the Syphon server
+            self._restart_syphon_server()
             
-            # Calculate content dimensions
-            content_width = dmx_width * pixel_width_with_gap
-            content_height = universe_count * pixel_height_with_gap
+            # Clear all Python object caches
+            self._color_cache.clear()
+            self._coordinate_cache.clear()
             
-            # Determine canvas dimensions
-            canvas_width = max(self.custom_canvas_width, content_width + self.start_x) if self.custom_canvas_width > 0 else content_width + self.start_x
-            canvas_height = max(self.custom_canvas_height, content_height + self.start_y) if self.custom_canvas_height > 0 else content_height + self.start_y
+            # Clear all array pools
+            self._cleanup_array_pool()
             
-            # Check if we're creating a new pixmap or reusing existing one
-            create_new_pixmap = (
-                self.full_res_pixmap is None or 
-                self.full_res_pixmap.width() != canvas_width or 
-                self.full_res_pixmap.height() != canvas_height
-            )
+            # Run multiple garbage collections with compaction
+            gc.collect(2)  # Full collection
             
-            # Create or reuse the full resolution pixmap for Syphon output
-            if create_new_pixmap:
-                # Create new pixmap
-                if self.full_res_pixmap is not None:
-                    # Clear old pixmap first to release memory
-                    del self.full_res_pixmap
-                    gc.collect()  # Force garbage collection
-                    
-                self.full_res_pixmap = QPixmap(canvas_width, canvas_height)
-                print(f"Created new full-res pixmap: {canvas_width}x{canvas_height}")
-            else:
-                # Just clear the existing pixmap
-                self.full_res_pixmap.fill(Qt.GlobalColor.transparent)
-            
-            # Calculate preview dimensions with scaling if needed
-            preview_width = canvas_width
-            preview_height = canvas_height
-            
-            if preview_width > self.max_preview_width or preview_height > self.max_preview_height:
-                width_ratio = self.max_preview_width / preview_width
-                height_ratio = self.max_preview_height / preview_height
-                scale_factor = min(width_ratio, height_ratio)
-                
-                preview_width = int(preview_width * scale_factor)
-                preview_height = int(preview_height * scale_factor)
-            
-            # Manage preview pixmap
-            create_new_preview = (
-                self.pixmap is None or 
-                self.pixmap.width() != preview_width or 
-                self.pixmap.height() != preview_height
-            )
-            
-            if create_new_preview:
-                # Clear old pixmap first
-                if self.pixmap is not None:
-                    del self.pixmap
-                    gc.collect()  # Force garbage collection
-                    
-                self.pixmap = QPixmap(preview_width, preview_height)
-            else:
-                # Just clear the existing pixmap
-                self.pixmap.fill(Qt.GlobalColor.transparent)
-            
-            # Create QPainters for both pixmaps
-            full_res_painter = QPainter(self.full_res_pixmap)
-            preview_painter = QPainter(self.pixmap)
-            
+            # Check if we have pympler for advanced memory debugging
             try:
-                # Draw DMX data
-                for i, universe in enumerate(universes):
-                    dmx_data = self.artnet_listener.get_buffer(universe)
-                    if dmx_data is None:
+                import pympler.muppy
+                import pympler.summary
+                
+                # Perform memory leak detection
+                all_objects = pympler.muppy.get_objects()
+                summary = pympler.summary.summarize(all_objects)
+                print("Memory usage by type:")
+                pympler.summary.print_(summary, limit=20)
+            except ImportError:
+                pass
+            
+            # Force another collection after analysis
+            gc.collect()
+            
+            # Print memory status after cleanup
+            mem_usage = self._get_memory_usage_mb()
+            print(f"Memory usage after emergency cleanup: {mem_usage:.2f} MB")
+        except Exception as e:
+            print(f"Error in emergency cleanup: {e}")
+        finally:
+            # Always release the pool
+            del pool
+
+    def _reset_texture_pool(self, reason="Manual reset"):
+        """Reset the texture pool completely to reclaim memory."""
+        from Foundation import NSAutoreleasePool
+        
+        # Create an autorelease pool
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            print(f"Resetting texture pool ({reason})...")
+            
+            # Release all textures in the pool
+            for size, textures in list(self._texture_pool.items()):
+                for texture in textures:
+                    self._safely_release_texture(texture, from_pool=True)
+                # Clear the list
+                self._texture_pool[size] = []
+            
+            # Clear empty pools
+            self._texture_pool = {}
+            
+            # Update the last reset time
+            self._last_pool_reset = self._frame_counter
+            
+            # Print memory status
+            print(f"Memory usage after pool reset: {self._get_memory_usage_mb():.2f} MB")
+            self._log_texture_stats()
+        except Exception as e:
+            print(f"Error resetting texture pool: {e}")
+        finally:
+            # Always release the pool
+            del pool
+
+    def _reduce_texture_pool_size(self):
+        """Reduce the texture pool size if needed."""
+        from Foundation import NSAutoreleasePool
+        
+        # Create an autorelease pool
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            # For each size category, make sure we don't have too many textures
+            for size, textures in list(self._texture_pool.items()):
+                while len(textures) > self._max_pool_size:
+                    # Release the excess textures
+                    texture = textures.pop(0)  # Remove the oldest
+                    self._safely_release_texture(texture, from_pool=True)
+                    if self._debug_memory:
+                        print(f"Reduced pool size for {size}: {len(textures)}")
+        except Exception as e:
+            print(f"Error reducing texture pool size: {e}")
+        finally:
+            # Always release the pool
+            del pool
+
+    def _trim_texture_pool(self):
+        """Trim the texture pool to remove old unused textures."""
+        from Foundation import NSAutoreleasePool
+        
+        # Create an autorelease pool
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            print("Trimming texture pool...")
+            
+            # Check for textures that haven't been used in a while
+            current_frame = self._frame_counter
+            old_frame_threshold = 1000  # ~23 seconds at 44fps
+            
+            # Check all tracked textures
+            for texture_id, info in list(self._texture_tracker.items()):
+                last_used = info.get('last_used', 0)
+                if (current_frame - last_used) > old_frame_threshold:
+                    # Skip if it's the current texture
+                    if hasattr(self, 'metal_texture') and id(self.metal_texture) == texture_id:
                         continue
                     
-                    # Calculate row position
-                    row_y = self.start_y + (i * pixel_height_with_gap)
+                    # Check if this texture is in any pool
+                    for size, textures in list(self._texture_pool.items()):
+                        for i, texture in enumerate(textures):
+                            if id(texture) == texture_id:
+                                # Remove from pool and release
+                                textures.pop(i)
+                                self._safely_release_texture(texture, from_pool=True)
+                                if self._debug_memory:
+                                    print(f"Trimmed old texture {texture_id} from pool")
+                                break
+            
+            # Print updated stats
+            self._log_texture_stats()
+        except Exception as e:
+            print(f"Error trimming texture pool: {e}")
+        finally:
+            # Always release the pool
+            del pool
+
+    def _force_texture_recreation(self):
+        """Force texture recreation to avoid Metal texture leaks."""
+        from Foundation import NSAutoreleasePool
+        
+        # Create an autorelease pool
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            print("Forcing texture recreation...")
+            
+            # Release the current texture if it exists
+            if hasattr(self, 'metal_texture') and self.metal_texture:
+                # Get the current dimensions before releasing
+                dimensions = self._texture_dimensions
+                
+                # Release the current texture
+                self._safely_release_texture(self.metal_texture)
+                self.metal_texture = None
+                
+                # Reset the texture dimensions
+                self._texture_dimensions = (0, 0)
+                
+                # Create a new texture (will happen on next frame)
+                print("Texture will be recreated on next frame")
+        except Exception as e:
+            print(f"Error forcing texture recreation: {e}")
+        finally:
+            # Always release the pool
+            del pool
+
+    def _log_texture_stats(self):
+        """Log texture usage statistics"""
+        active_textures = len(self._texture_tracker)
+        pooled_textures = sum(len(textures) for textures in self._texture_pool.values())
+        print(f"Texture stats: created={self._total_textures_created}, "
+              f"released={self._total_textures_released}, "
+              f"active={active_textures}, pooled={pooled_textures}")
+
+    def _return_texture_to_pool(self, texture, dimensions):
+        """Return a texture to the pool for later reuse"""
+        from Foundation import NSAutoreleasePool
+        
+        # Create an autorelease pool
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            if not texture or dimensions == (0, 0):
+                del pool
+                return
+                
+            # Update texture usage tracking
+            texture_id = id(texture)
+            if texture_id in self._texture_tracker:
+                self._texture_tracker[texture_id]['last_used'] = self._frame_counter
+            
+            # Initialize pool for this size if needed
+            if dimensions not in self._texture_pool:
+                self._texture_pool[dimensions] = []
+            
+            # Only add to pool if we haven't reached the max size
+            if len(self._texture_pool[dimensions]) < self._max_pool_size:
+                # Check if this exact texture is already in the pool (avoid duplication)
+                for existing_texture in self._texture_pool[dimensions]:
+                    if id(existing_texture) == texture_id:
+                        # Already in pool, don't add again
+                        if self._debug_memory:
+                            print(f"Texture {texture_id} already in pool, not adding again")
+                        del pool
+                        return
+                
+                # Add to pool with reference count
+                self._texture_pool[dimensions].append(texture)
+                
+                # Sort textures by last used time to ensure oldest are released first
+                if texture_id in self._texture_tracker:
+                    self._texture_pool[dimensions].sort(
+                        key=lambda t: self._texture_tracker.get(id(t), {}).get('last_used', 0)
+                    )
+            else:
+                # Pool is full, just release the texture
+                self._safely_release_texture(texture, from_pool=True)
+        except Exception as e:
+            print(f"Error returning texture to pool: {e}")
+        finally:
+            # Always release the pool
+            del pool
+
+    def update_canvas(self):
+        """Update the canvas with current DMX values"""
+        try:
+            # Increment frame counter
+            self._frame_counter += 1
+            
+            # Check memory usage periodically
+            if self._memory_tracking_enabled and self._frame_counter % self._memory_check_interval == 0:
+                self._check_memory_usage()
+            
+            # Perform texture pool maintenance
+            if self._frame_counter % 100 == 0:
+                self._trim_texture_pool()
+                
+            # Reset texture pool periodically to avoid memory growth
+            pool_reset_interval = 5000  # About 2 minutes at 44fps
+            if self._frame_counter - self._last_pool_reset > pool_reset_interval:
+                self._reset_texture_pool("Scheduled reset")
+                
+            # Look for orphaned texture objects periodically
+            if self._frame_counter % 200 == 0:
+                self._clean_orphaned_textures()
+                
+            # Recreate texture periodically to avoid Metal texture leaks
+            texture_recreation_interval = 2000  # About 45 seconds at 44fps
+            if self._frame_counter - self._last_texture_recreation > texture_recreation_interval:
+                self._force_texture_recreation()
+                self._last_texture_recreation = self._frame_counter
+                
+            # Restart Syphon server periodically to mitigate memory leaks in the Syphon framework
+            syphon_restart_interval = 10000  # About 4 minutes at 44fps
+            if self._frame_counter - self._last_syphon_restart > syphon_restart_interval:
+                # Only restart if memory usage is above a threshold
+                if self._get_memory_usage_mb() > (self._memory_soft_limit_mb * 0.8):  # 80% of soft limit
+                    self._restart_syphon_server()
+            
+            # Get DMX data for all universes
+            universes = self.artnet_listener.universes
+            universe_count = len(universes)
+            
+            if self.verbose:
+                print(f"Updating canvas with {universe_count} universes")
+            
+            if universe_count > 0:
+                # Calculate canvas dimensions based on visualization parameters
+                dmx_width = 512
+                
+                # Calculate pixel dimensions including gaps
+                pixel_width_with_gap = self.pixel_size + self.gap_x
+                pixel_height_with_gap = self.pixel_size + self.gap_y
+                
+                # Calculate content dimensions - ensure at least one pixel of height for empty universes
+                content_width = dmx_width * pixel_width_with_gap
+                content_height = max(universe_count, 1) * pixel_height_with_gap
+                
+                # Determine canvas dimensions
+                canvas_width = max(self.custom_canvas_width, content_width + self.start_x) if self.custom_canvas_width > 0 else content_width + self.start_x
+                canvas_height = max(self.custom_canvas_height, content_height + self.start_y) if self.custom_canvas_height > 0 else content_height + self.start_y
+                
+                # Ensure minimum canvas dimensions
+                canvas_width = max(canvas_width, 10)
+                canvas_height = max(canvas_height, 10)
+                
+                # Check if we're creating a new pixmap or reusing existing one
+                create_new_pixmap = (
+                    self.full_res_pixmap is None or 
+                    self.full_res_pixmap.width() != canvas_width or 
+                    self.full_res_pixmap.height() != canvas_height
+                )
+                
+                # Create or reuse the full resolution pixmap for Syphon output
+                if create_new_pixmap:
+                    # Create new pixmap
+                    if self.full_res_pixmap is not None:
+                        # Clear old pixmap first to release memory
+                        del self.full_res_pixmap
+                        gc.collect()  # Force garbage collection
+                        
+                    self.full_res_pixmap = QPixmap(canvas_width, canvas_height)
+                    print(f"Created new full-res pixmap: {canvas_width}x{canvas_height}")
+                else:
+                    # Just clear the existing pixmap
+                    self.full_res_pixmap.fill(Qt.GlobalColor.transparent)
+                
+                # Calculate preview dimensions with scaling if needed
+                preview_width = canvas_width
+                preview_height = canvas_height
+                
+                if preview_width > self.max_preview_width or preview_height > self.max_preview_height:
+                    width_ratio = self.max_preview_width / preview_width
+                    height_ratio = self.max_preview_height / preview_height
+                    scale_factor = min(width_ratio, height_ratio)
                     
-                    # Draw each DMX channel as a pixel
-                    for j in range(min(len(dmx_data), 512)):
-                        # Calculate pixel position
-                        pixel_x = self.start_x + (j * pixel_width_with_gap)
-                        
-                        # Get DMX value (0-255)
-                        value = dmx_data[j]
-                        
-                        # Get cached color
-                        color = self._get_cached_color(value)
-                        
-                        # Draw on both pixmaps
-                        full_res_painter.fillRect(pixel_x, row_y, self.pixel_size, self.pixel_size, color)
-                        
-                        # Get cached coordinates for preview
-                        preview_x, preview_y, preview_size = self._get_cached_coordinates(
-                            pixel_x, row_y, preview_width, canvas_width, preview_height, canvas_height
-                        )
-                        
-                        preview_painter.fillRect(preview_x, preview_y, preview_size, preview_size, color)
+                    preview_width = int(preview_width * scale_factor)
+                    preview_height = int(preview_height * scale_factor)
                 
-                # End painters
-                full_res_painter.end()
-                preview_painter.end()
+                # Ensure minimum preview dimensions
+                preview_width = max(preview_width, 1)
+                preview_height = max(preview_height, 1)
                 
-                # Clean up painter objects explicitly
-                del full_res_painter
-                del preview_painter
+                # Manage preview pixmap
+                create_new_preview = (
+                    self.pixmap is None or 
+                    self.pixmap.width() != preview_width or 
+                    self.pixmap.height() != preview_height
+                )
                 
-                # Update Syphon frame
-                self.update_syphon_frame()
+                if create_new_preview:
+                    # Clear old pixmap first
+                    if self.pixmap is not None:
+                        del self.pixmap
+                        gc.collect()  # Force garbage collection
+                        
+                    self.pixmap = QPixmap(preview_width, preview_height)
+                else:
+                    # Just clear the existing pixmap
+                    self.pixmap.fill(Qt.GlobalColor.transparent)
                 
-                # Force update of the widget
-                self.update()
+                # Create QPainters for both pixmaps
+                full_res_painter = QPainter(self.full_res_pixmap)
+                preview_painter = QPainter(self.pixmap)
                 
-                # Periodic cleanup
-                if self._frame_counter % 60 == 0:
-                    # Clear caches periodically to prevent memory growth
-                    self._color_cache.clear()
-                    self._coordinate_cache.clear()
+                try:
+                    # Draw DMX data
+                    for i, universe in enumerate(universes):
+                        dmx_data = self.artnet_listener.get_buffer(universe)
+                        if dmx_data is None:
+                            continue
+                        
+                        # Calculate row position
+                        row_y = self.start_y + (i * pixel_height_with_gap)
+                        
+                        # Draw each DMX channel as a pixel
+                        for j in range(min(len(dmx_data), 512)):
+                            # Calculate pixel position
+                            pixel_x = self.start_x + (j * pixel_width_with_gap)
+                            
+                            # Get DMX value (0-255)
+                            value = dmx_data[j]
+                            
+                            # Get cached color
+                            color = self._get_cached_color(value)
+                            
+                            # Draw on both pixmaps
+                            full_res_painter.fillRect(pixel_x, row_y, self.pixel_size, self.pixel_size, color)
+                            
+                            # Get cached coordinates for preview
+                            preview_x, preview_y, preview_size = self._get_cached_coordinates(
+                                pixel_x, row_y, preview_width, canvas_width, preview_height, canvas_height
+                            )
+                            
+                            preview_painter.fillRect(preview_x, preview_y, preview_size, preview_size, color)
                     
-                    # Do a deeper cleanup every minute (60fps * 60 = 3600 frames or 44fps * 60 = 2640 frames)
-                    if self._frame_counter % 3600 == 0 and self._frame_counter > 0:
-                        self._do_major_cleanup()
-            except Exception as e:
-                print(f"Error updating canvas: {e}")
-            finally:
-                # Ensure painters are properly cleaned up if exception occurred
-                if 'full_res_painter' in locals() and full_res_painter.isActive():
+                    # End painters
                     full_res_painter.end()
-                if 'preview_painter' in locals() and preview_painter.isActive():
                     preview_painter.end()
-        elif self.verbose:
-            print("No universes found. Canvas not updated.")
-    
-    def _do_major_cleanup(self):
-        """Perform a major cleanup to release memory"""
-        print("Performing major memory cleanup...")
-        
-        # Clear all caches
-        self._color_cache.clear()
-        self._coordinate_cache.clear()
-        
-        # Force garbage collection
-        gc.collect()
-        
-        # Log memory usage after cleanup
-        if self._psutil_available:
-            mem_info = self._process.memory_info()
-            current_usage_mb = mem_info.rss / (1024 * 1024)
-            print(f"Memory usage after cleanup: {current_usage_mb:.2f} MB")
-    
+                    
+                    # Clean up painter objects explicitly
+                    del full_res_painter
+                    del preview_painter
+                    
+                    # Update Syphon frame
+                    self.update_syphon_frame()
+                    
+                    # Force update of the widget
+                    self.update()
+                    
+                    # Periodic cleanup
+                    if self._frame_counter % 60 == 0:
+                        # Clear caches periodically to prevent memory growth
+                        self._color_cache.clear()
+                        self._coordinate_cache.clear()
+                        
+                        # Do a deeper cleanup every minute (60fps * 60 = 3600 frames or 44fps * 60 = 2640 frames)
+                        if self._frame_counter % 3600 == 0 and self._frame_counter > 0:
+                            self._do_major_cleanup()
+                except Exception as e:
+                    print(f"Error updating canvas: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    # Ensure painters are properly cleaned up if exception occurred
+                    if 'full_res_painter' in locals() and full_res_painter.isActive():
+                        full_res_painter.end()
+                    if 'preview_painter' in locals() and preview_painter.isActive():
+                        preview_painter.end()
+            elif self.verbose:
+                print("No universes found. Canvas not updated.")
+        except Exception as e:
+            print(f"Error updating canvas: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _validate_frame_data(self, frame_width, frame_height):
         """Validate frame dimensions and check if there's actual content to display"""
         if frame_width <= 0 or frame_height <= 0:
-            if self._frame_counter % 60 == 0:
-                print(f"Invalid frame dimensions: {frame_width}x{frame_height}")
+            print(f"Invalid frame dimensions: {frame_width}x{frame_height}")
             return False
             
         # Check if there are any universes to display
-        if len(self.artnet_listener.universes) == 0:
+        universe_count = len(self.artnet_listener.universes)
+        if universe_count == 0:
             if self._frame_counter % 60 == 0:
                 print("No universes to display")
             return False
             
         # Check if at least one universe has data
         has_data = False
+        empty_universes = []
         for universe in self.artnet_listener.universes:
-            if self.artnet_listener.get_buffer(universe) is not None:
+            data = self.artnet_listener.get_buffer(universe)
+            if data is not None:
                 has_data = True
-                break
+                if len(data) == 0:
+                    empty_universes.append(universe)
+            else:
+                empty_universes.append(universe)
                 
+        # Log empty universes periodically
+        if empty_universes and self._frame_counter % 120 == 0:
+            print(f"Empty or null universes: {empty_universes}")
+            
         if not has_data and self._frame_counter % 60 == 0:
+            # Print the number of universes and their sizes for debugging
+            universe_info = []
+            for universe in self.artnet_listener.universes:
+                data = self.artnet_listener.get_buffer(universe)
+                size = len(data) if data is not None else 0
+                universe_info.append(f"Universe {universe}: {size} channels")
+            print(f"Universe data: {universe_info}")
             print("No DMX data available in any universe")
             
-        return has_data
+        # Return true even if we have empty universes - we'll at least show the grid
+        return universe_count > 0
     
     def update_syphon_frame(self):
         """Update the Syphon frame with current canvas content"""
+        
+        # Create an autorelease pool for this frame cycle
+        import objc
+        from Foundation import NSAutoreleasePool
+        pool = NSAutoreleasePool.alloc().init()
+        
         # Always increment frame counter whether or not server exists
         self._frame_counter += 1
         
-        if not self.server:
-            return
+        # Check if we need a pool reset (more frequently to avoid buildup)
+        pool_reset_interval = 3000  # frames (~1 minute @ 44fps)
+        if (self._frame_counter - self._last_pool_reset) > pool_reset_interval:
+            self._reset_texture_pool("Scheduled reset")
             
+        # More frequent texture trimming to remove unused textures
+        trim_interval = 500  # frames
+        if self._frame_counter % trim_interval == 0:
+            self._trim_texture_pool()
+        
+        # Check if we need to force texture recreation (more frequently)
+        texture_recreation_interval = 8800  # frames (~3 minutes @ 44fps)
+        if (self._frame_counter - self._last_texture_recreation) > texture_recreation_interval:
+            self._force_texture_recreation()
+            self._last_texture_recreation = self._frame_counter
+        
+        # Periodically synchronize object pools with GC
+        sync_interval = 1000  # frames (~23 seconds @ 44fps)
+        if self._frame_counter % sync_interval == 0:
+            problem_count = self._synchronize_pools_with_gc()
+            if problem_count > 0 and self._frame_counter % 3000 == 0:
+                # If problems persist, try a harder cleanup
+                self._perform_hard_cleanup()
+        
+        if not self.server:
+            # Still drain the pool even if we didn't do anything
+            del pool
+            return
+        
         try:
-            # Skip if application is being closed
-            if not hasattr(self, 'update_timer') or not self.update_timer.isActive():
+            # Skip if application is closing/closed
+            if not hasattr(self, 'update_timer'):
+                del pool
                 return
                 
             # Check which Syphon implementation we're using
@@ -812,20 +1320,48 @@ class CanvasWidget(QWidget):
                 if self._frame_counter % 60 == 0:
                     print(f"Using default dimensions: {width}x{height}")
             
+            # Update texture tracker for current texture
+            if hasattr(self, 'metal_texture') and self.metal_texture:
+                texture_id = id(self.metal_texture)
+                if texture_id in self._texture_tracker:
+                    self._texture_tracker[texture_id]['last_used'] = self._frame_counter
+                else:
+                    # Re-register if somehow not in tracker
+                    self._texture_tracker[texture_id] = {
+                        'size': getattr(self, '_texture_dimensions', (0, 0)),
+                        'created_at': self._frame_counter,
+                        'last_used': self._frame_counter
+                    }
+            
             # Validate frame data
             if not self._validate_frame_data(width, height):
-                return
+                # Create a very simple frame even when no data is available
+                if self._frame_counter % 300 == 0:
+                    print("Creating simple empty frame")
+                
+                # If we have no real data, we'll still send a simple frame
+                # This helps keep the Syphon connection alive
+                # The rest of the method will proceed with the default dimensions
             
-            # Perform deep memory cleanup every 300 frames (about every 7 seconds at 44fps)
-            if self._frame_counter % 300 == 0 and self._frame_counter > 0:
+            # More frequent memory cleanup
+            cleanup_interval = 200  # frames (was 300)
+            if self._frame_counter % cleanup_interval == 0 and self._frame_counter > 0:
                 # Perform garbage collection
                 gc.collect()
+                
+                # Check for orphaned textures that aren't being tracked properly
+                self._clean_orphaned_textures()
                 
                 # Log memory usage periodically
                 if self._psutil_available:
                     mem_info = self._process.memory_info()
                     current_usage_mb = mem_info.rss / (1024 * 1024)
                     print(f"Memory usage: {current_usage_mb:.2f} MB")
+                    
+                    # Perform texture cleanup when memory is getting high
+                    if current_usage_mb > self._memory_soft_limit_mb * 0.8:
+                        print(f"Memory usage approaching soft limit, cleaning texture pool")
+                        self._trim_texture_pool()
             
             # Metal-based Syphon publishing
             if self.using_metal:
@@ -835,22 +1371,33 @@ class CanvasWidget(QWidget):
                     if (not hasattr(self, 'metal_texture') or self.metal_texture is None or
                         current_dimensions != (width, height)):
                         # Only log when dimensions change
-                        print(f"Creating new Metal texture with dimensions {width}x{height}")
+                        if current_dimensions != (width, height):
+                            print(f"Creating new Metal texture with dimensions {width}x{height}")
                         self._init_metal_texture()
                     
+                    # Skip if texture initialization failed
+                    if not hasattr(self, 'metal_texture') or self.metal_texture is None:
+                        if self._frame_counter % 60 == 0:
+                            print("Skipping frame - no valid Metal texture")
+                        return
+                    
                     # Copy pixmap data to metal texture
-                    if hasattr(self, 'metal_texture') and self.metal_texture and self.full_res_pixmap:
+                    if self.full_res_pixmap and not self.full_res_pixmap.isNull():
                         try:
                             # Convert QPixmap to QImage in RGBA format (only once)
                             image = self.full_res_pixmap.toImage()
+                            if image.isNull():
+                                return
+                                
                             if image.format() != QImage.Format.Format_RGBA8888:
                                 image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+                                if image.isNull():
+                                    return
                             
                             # Use most direct approach possible for copying data
                             import numpy as np
                             from syphon.utils.numpy import copy_image_to_mtl_texture
                             
-                            # More efficient direct buffer management
                             # Get access to the raw image data
                             bytes_per_line = image.bytesPerLine()
                             bits_ptr = image.constBits()
@@ -866,19 +1413,25 @@ class CanvasWidget(QWidget):
                                 
                                 # Reshape the buffer to proper dimensions
                                 if bytes_per_line == width * 4:  # Perfect alignment
-                                    # Direct reshape without copying
-                                    pixel_array = buffer.reshape((height, width, 4))
+                                    # Get a properly sized array from the pool
+                                    pixel_array = self._get_array_from_pool(height, width, 4, np.uint8)
                                     
-                                    # Copy pixel data to Metal texture
-                                    copy_image_to_mtl_texture(pixel_array, self.metal_texture)
+                                    # Copy data from buffer to our pooled array
+                                    np.copyto(pixel_array, buffer.reshape((height, width, 4)))
+                                    
+                                    # Copy pixel data to Metal texture (with null check)
+                                    if self.metal_texture is not None:
+                                        copy_image_to_mtl_texture(pixel_array, self.metal_texture)
+                                    else:
+                                        if self._frame_counter % 60 == 0:
+                                            print("Skipping texture update - texture is None")
+                                            
+                                    # Return the array to the pool
+                                    self._return_array_to_pool(pixel_array)
                                 else:
                                     # With stride handling
-                                    # Make sure we only create the buffer once per size
-                                    if (not hasattr(self, '_pixel_buffer') or 
-                                        self._pixel_buffer is None or 
-                                        self._pixel_buffer.shape != (height, width, 4)):
-                                        # Create a new buffer of the right size
-                                        self._pixel_buffer = np.zeros((height, width, 4), dtype=np.uint8)
+                                    # Get a properly sized array from the pool
+                                    pixel_array = self._get_array_from_pool(height, width, 4, np.uint8)
                                     
                                     # Copy data row by row respecting stride
                                     for y in range(height):
@@ -886,10 +1439,18 @@ class CanvasWidget(QWidget):
                                         row_end = row_start + (width * 4)
                                         # Make sure we don't go past the buffer end
                                         if row_end <= total_bytes:
-                                            self._pixel_buffer[y] = buffer[row_start:row_end].reshape(width, 4)
+                                            row_data = buffer[row_start:row_end].reshape(width, 4)
+                                            pixel_array[y] = row_data
                                     
-                                    # Copy pixel data to Metal texture
-                                    copy_image_to_mtl_texture(self._pixel_buffer, self.metal_texture)
+                                    # Copy pixel data to Metal texture (with null check)
+                                    if self.metal_texture is not None:
+                                        copy_image_to_mtl_texture(pixel_array, self.metal_texture)
+                                    else:
+                                        if self._frame_counter % 60 == 0:
+                                            print("Skipping texture update - texture is None")
+                                            
+                                    # Return the array to the pool
+                                    self._return_array_to_pool(pixel_array)
                             else:
                                 # If direct buffer access fails, log once per session
                                 if not hasattr(self, '_buffer_access_failed'):
@@ -898,8 +1459,9 @@ class CanvasWidget(QWidget):
                             
                             # Publish the frame - using the simplest API possible
                             try:
-                                # Use the simplest form of the API
-                                if hasattr(self.server, 'publish_frame_texture'):
+                                # Check that texture is valid and server exists
+                                if (self.server is not None and hasattr(self.server, 'publish_frame_texture') and
+                                    self.metal_texture is not None):
                                     self.server.publish_frame_texture(
                                         texture=self.metal_texture, 
                                         is_flipped=True  # Explicitly set is_flipped parameter
@@ -908,85 +1470,159 @@ class CanvasWidget(QWidget):
                                     # Log occasionally
                                     if self._frame_counter % 300 == 0:
                                         print(f"Metal frame published: {width}x{height}")
-                                else:
+                                elif self.server is not None:
                                     # Fallback to simple publish
                                     self.server.publish()
                                     
                                     if self._frame_counter % 300 == 0:
                                         print("Using basic publish() method")
+                                else:
+                                    if self._frame_counter % 300 == 0:
+                                        print("Cannot publish - server is None")
+                                
                             except Exception as e:
                                 print(f"Error in frame publishing: {e}")
                                 
+                            # Clean up the QImage
+                            del image
+                            
                         except Exception as e:
-                            if self._frame_counter % 60 == 0:
-                                print(f"Error in Metal texture data handling: {e}")
-                                if hasattr(self, 'metal_texture'):
-                                    print(f"Metal texture exists: {self.metal_texture is not None}")
+                            print(f"Error in Metal texture data handling: {e}")
+                            
                 except Exception as e:
                     print(f"Error in Metal publishing: {e}")
+                    
+            # OpenGL publishing handled elsewhere...
             
-            # OpenGL publishing
-            elif not self.using_metal:
-                # OpenGL implementation similar to before...
-                if self.full_res_pixmap and not self.full_res_pixmap.isNull():
-                    # Convert QPixmap to QImage
-                    image = self.full_res_pixmap.toImage()
-                    if not image.isNull():
-                        try:
-                            # Convert to RGB32 format
-                            image = image.convertToFormat(QImage.Format.Format_RGB32)
-                            
-                            # Get dimensions
-                            size = image.size()
-                            width = size.width()
-                            height = size.height()
-                            
-                            # Try the NSImage approach
-                            ns_image = self._qimage_to_nsimage(image)
-                            if ns_image is not None:
-                                # Try available publishing methods
-                                published = False
-                                if hasattr(self.server, 'publishImage_'):
-                                    self.server.publishImage_(ns_image)
-                                    published = True
-                                elif hasattr(self.server, 'publish_frame_image'):
-                                    self.server.publish_frame_image(ns_image)
-                                    published = True
-                                elif hasattr(self.server, 'publish_image'):
-                                    self.server.publish_image(ns_image)
-                                    published = True
-                                elif hasattr(self.server, 'publish_nsimage'):
-                                    self.server.publish_nsimage(ns_image)
-                                    published = True
-                                elif hasattr(self.server, 'publish_texture'):
-                                    self.server.publish_texture(ns_image)
-                                    published = True
-                                
-                                # Log occasionally
-                                if published and self._frame_counter % 300 == 0:
-                                    print(f"NSImage published: {width}x{height}")
-                                    
-                                # Clean up explicitly
-                                del ns_image
-                            else:
-                                if self._frame_counter % 300 == 0:
-                                    print("Failed to create NSImage")
-                                    
-                            # Clean up explicitly
-                            del image
-                                    
-                        except Exception as e:
-                            if self._frame_counter % 300 == 0:
-                                print(f"Error in OpenGL publishing: {e}")
-                                
         except Exception as e:
-            if self._frame_counter % 300 == 0:
-                print(f"Error in update_syphon_frame: {e}")
+            print(f"Error in update_syphon_frame: {e}")
+        finally:
+            # Always release the pool
+            del pool
+
+    def _clean_orphaned_textures(self):
+        """Find and clean up orphaned textures not properly tracked"""
+        import gc
+        
+        # Create an autorelease pool
+        from Foundation import NSAutoreleasePool
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            # Get all Metal texture objects from gc
+            metal_objects = []
+            for obj in gc.get_objects():
+                # Check for Metal texture objects by their class name
+                class_name = obj.__class__.__name__ if hasattr(obj, '__class__') else ""
+                if "MTLTexture" in class_name:
+                    metal_objects.append(obj)
+            
+            # Count how many aren't in our tracker
+            orphaned = 0
+            for obj in metal_objects:
+                obj_id = id(obj)
+                if obj_id not in self._texture_tracker:
+                    orphaned += 1
+                    # Try to force release this object
+                    if hasattr(obj, 'release'):
+                        try:
+                            obj.release()
+                            # Set to None to help garbage collection
+                            obj = None
+                        except:
+                            pass
+            
+            if orphaned > 0:
+                print(f"Found and cleaned {orphaned} orphaned texture objects")
+                # Force garbage collection after cleanup
+                gc.collect()
                 
-        # Perform limited cleanup after each frame
-        if self._frame_counter % 10 == 0:
-            # Explicitly call garbage collection
+                # Check memory usage after cleanup
+                mem_usage = self._get_memory_usage_mb()
+                print(f"Memory usage: {mem_usage:.2f} MB")
+                
+                # If memory is still high after cleaning orphaned textures,
+                # consider more aggressive cleanup
+                if mem_usage > self._memory_soft_limit_mb:
+                    print("Memory usage approaching soft limit, cleaning texture pool")
+                    self._trim_texture_pool()
+                    
+                    # If we're still high after trimming, check if we should restart the server
+                    if mem_usage > self._memory_hard_limit_mb and self._frame_counter - self._last_syphon_restart > 3000:
+                        self._restart_syphon_server()
+            
+        except Exception as e:
+            print(f"Error in _clean_orphaned_textures: {e}")
+        finally:
+            # Always release the pool
+            del pool
+            
+    def _restart_syphon_server(self):
+        """Completely restart the Syphon server to mitigate memory leaks in the native framework"""
+        from Foundation import NSAutoreleasePool
+        
+        # Create autorelease pool for the restart operation
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            print("Performing complete Syphon server restart to mitigate memory leak...")
+            
+            # Record the last restart time
+            self._last_syphon_restart = self._frame_counter
+            
+            # Stop and release existing Syphon server
+            if hasattr(self, 'server') and self.server:
+                print("Stopping Syphon server...")
+                self.server.stop()
+                self.server = None
+            
+            # Force cleanup of all texture resources
+            self._reset_texture_pool("Syphon restart")
+            
+            # Force garbage collection
+            import gc
             gc.collect()
+            
+            # Create new server with fresh Metal context
+            import syphon
+            
+            if self.using_metal:
+                try:
+                    # Import needed libraries
+                    import objc
+                    import Metal
+                    import syphon.utils.numpy
+                    
+                    # Create fresh Metal device and command queue
+                    self.metal_device = Metal.MTLCreateSystemDefaultDevice()
+                    self.metal_command_queue = self.metal_device.newCommandQueue()
+                    
+                    # Create server with Metal backend
+                    self.server = syphon.SyphonMetalServer("ArtNetViz Syphon",
+                                                      self.metal_device,
+                                                      self.metal_command_queue)
+                    
+                    # Reset texture tracking variables
+                    self.metal_texture = None
+                    self._texture_dimensions = (0, 0)
+                    
+                    print("Syphon server restarted successfully")
+                    
+                except Exception as e:
+                    print(f"Error restarting Syphon server: {e}")
+                    
+            # Force another garbage collection after server creation
+            gc.collect()
+            
+            # Check memory after restart
+            mem_usage = self._get_memory_usage_mb()
+            print(f"Memory usage after Syphon restart: {mem_usage:.2f} MB")
+            
+        except Exception as e:
+            print(f"Error in Syphon server restart: {e}")
+        finally:
+            # Always release the pool
+            del pool
 
     def paintEvent(self, event):
         """Paint the canvas on the widget"""
@@ -1034,97 +1670,78 @@ class CanvasWidget(QWidget):
             painter.end()
     
     def cleanup(self):
-        """Clean up resources"""
+        """Clean up all resources before exiting."""
+        from Foundation import NSAutoreleasePool
+        
+        # Create an autorelease pool for cleanup operations
+        pool = NSAutoreleasePool.alloc().init()
+        
         try:
             print("Starting full application cleanup...")
             
-            # Stop the update timer
-            if hasattr(self, 'update_timer') and self.update_timer:
-                self.update_timer.stop()
-            
-            # Clean up Syphon resources
-            if hasattr(self, 'server') and self.server:
-                try:
+            # Stop Syphon server first
+            try:
+                if hasattr(self, 'server') and self.server:
                     print("Stopping Syphon server...")
                     self.server.stop()
-                except Exception as e:
-                    print(f"Error stopping Syphon server: {e}")
-                finally:
                     self.server = None
-            
+            except Exception as e:
+                print(f"Error stopping Syphon server: {e}")
+                
+            # Stop update timer
+            try:
+                if hasattr(self, 'update_timer') and self.update_timer:
+                    print("Stopping update timer...")
+                    self.update_timer.stop()
+                    self.update_timer = None
+            except Exception as e:
+                print(f"Error stopping update timer: {e}")
+                
+            # Stop Syphon timer
+            try:
+                if hasattr(self, 'syphon_timer') and self.syphon_timer:
+                    print("Stopping Syphon timer...")
+                    self.syphon_timer.stop()
+                    self.syphon_timer = None
+            except Exception as e:
+                print(f"Error stopping Syphon timer: {e}")
+                
             # Clean up Metal resources
             if self.using_metal:
                 print("Cleaning up Metal resources...")
-                # Clear texture dimensions
-                if hasattr(self, '_texture_dimensions'):
-                    self._texture_dimensions = (0, 0)
-                        
-                if hasattr(self, '_pixel_buffer') and self._pixel_buffer is not None:
-                    try:
-                        del self._pixel_buffer
-                    except Exception as e:
-                        print(f"Error cleaning up pixel buffer: {e}")
-                    finally:
-                        self._pixel_buffer = None
                 
+                # Clean up texture pool
+                if hasattr(self, '_texture_pool'):
+                    pool_count = sum(len(textures) for textures in self._texture_pool.values())
+                    print(f"Cleaning up texture pool with {pool_count} textures")
+                    
+                    for size, textures in list(self._texture_pool.items()):
+                        while textures:
+                            texture = textures.pop()
+                            self._safely_release_texture(texture)
+                    
+                    self._texture_pool.clear()
+                
+                # Release the current texture
                 if hasattr(self, 'metal_texture') and self.metal_texture:
-                    try:
-                        del self.metal_texture
-                    except Exception as e:
-                        print(f"Error cleaning up Metal texture: {e}")
-                    finally:
-                        self.metal_texture = None
+                    self._safely_release_texture(self.metal_texture)
+                    self.metal_texture = None
+            
+            # Clean up numpy array pool
+            if hasattr(self, '_array_pool'):
+                array_count = sum(len(arrays) for arrays in self._array_pool.values())
+                print(f"Cleaning up array pool with {array_count} arrays")
+                self._cleanup_array_pool()
                 
-                if hasattr(self, 'metal_command_queue') and self.metal_command_queue:
-                    try:
-                        del self.metal_command_queue
-                    except Exception as e:
-                        print(f"Error cleaning up Metal command queue: {e}")
-                    finally:
-                        self.metal_command_queue = None
-                
-                if hasattr(self, 'metal_device') and self.metal_device:
-                    try:
-                        del self.metal_device
-                    except Exception as e:
-                        print(f"Error cleaning up Metal device: {e}")
-                    finally:
-                        self.metal_device = None
+            # Clean up in-use array tracking
+            if hasattr(self, '_array_in_use'):
+                print(f"Clearing {len(self._array_in_use)} in-use array references")
+                self._array_in_use.clear()
             
             # Clean up pixmaps
             print("Cleaning up pixmaps...")
-            if hasattr(self, 'pixmap') and self.pixmap:
-                try:
-                    del self.pixmap
-                except Exception as e:
-                    print(f"Error cleaning up pixmap: {e}")
-                finally:
-                    self.pixmap = None
-            
-            if hasattr(self, 'full_res_pixmap') and self.full_res_pixmap:
-                try:
-                    del self.full_res_pixmap
-                except Exception as e:
-                    print(f"Error cleaning up full_res_pixmap: {e}")
-                finally:
-                    self.full_res_pixmap = None
-            
-            # Clean up painters
-            if hasattr(self, '_painter') and self._painter:
-                try:
-                    del self._painter
-                except Exception as e:
-                    print(f"Error cleaning up painter: {e}")
-                finally:
-                    self._painter = None
-            
-            if hasattr(self, '_full_res_painter') and self._full_res_painter:
-                try:
-                    del self._full_res_painter
-                except Exception as e:
-                    print(f"Error cleaning up full_res_painter: {e}")
-                finally:
-                    self._full_res_painter = None
+            if hasattr(self, 'full_res_pixmap'):
+                self.full_res_pixmap = None
             
             # Clean up caches
             print("Cleaning up caches...")
@@ -1132,30 +1749,18 @@ class CanvasWidget(QWidget):
                 self._color_cache.clear()
             if hasattr(self, '_coordinate_cache'):
                 self._coordinate_cache.clear()
-            
-            # Clean up Syphon array
-            if hasattr(self, '_syphon_array'):
-                self._syphon_array = None
-            if hasattr(self, '_syphon_array_dims'):
-                self._syphon_array_dims = None
-            
-            # Force garbage collection
+                
+            # Force final garbage collection
             print("Forcing final garbage collection...")
             gc.collect()
             
-            # Final memory report
-            if self._psutil_available:
-                mem_info = self._process.memory_info()
-                current_usage_mb = mem_info.rss / (1024 * 1024)
-                print(f"Final memory usage: {current_usage_mb:.2f} MB")
-            
+            print(f"Final memory usage: {self._get_memory_usage_mb():.2f} MB")
             print("Cleanup completed")
-            
         except Exception as e:
             print(f"Error during cleanup: {e}")
         finally:
-            # Reset flags
-            self.using_metal = False
+            # Always release the pool
+            del pool
 
     def __del__(self):
         """Clean up resources when object is deleted"""
@@ -1260,6 +1865,298 @@ class CanvasWidget(QWidget):
             print(f"Error showing Syphon info: {e}")
             import traceback
             traceback.print_exc()
+
+    def _get_memory_usage_mb(self):
+        """Get current memory usage in MB"""
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            return mem_info.rss / (1024 * 1024)
+        else:
+            return 0
+
+    def _do_major_cleanup(self):
+        """Perform a major cleanup to release memory"""
+        print("Performing major memory cleanup...")
+        
+        # Clear all caches
+        self._color_cache.clear()
+        self._coordinate_cache.clear()
+        
+        # Check if we can release any texture pool resources
+        if hasattr(self, '_texture_pool'):
+            print("Trimming texture pool...")
+            # Keep only one texture of each size maximum
+            for size, textures in list(self._texture_pool.items()):
+                # Keep at most one texture for each size
+                while len(textures) > 1:
+                    texture = textures.pop()
+                    try:
+                        self._safely_release_texture(texture)
+                    except Exception as e:
+                        print(f"Error releasing texture from pool: {e}")
+        
+        # Log texture statistics
+        if hasattr(self, '_texture_tracker'):
+            self._log_texture_stats()
+            
+            # Check for potential leaks
+            current_frame = getattr(self, '_frame_counter', 0)
+            old_texture_threshold = 300  # frames
+            old_texture_ids = [
+                texture_id for texture_id, info in self._texture_tracker.items()
+                if current_frame - info['last_used'] > old_texture_threshold
+            ]
+            
+            # If we find old textures that haven't been used recently, they may be leaking
+            if old_texture_ids:
+                print(f"WARNING: Found {len(old_texture_ids)} textures that haven't been used "
+                      f"for over {old_texture_threshold} frames")
+                
+                # Try to release leaked textures
+                for texture_id in old_texture_ids:
+                    # If this is our current active texture, it should be updated on next frame
+                    if hasattr(self, 'metal_texture') and id(self.metal_texture) == texture_id:
+                        print(f"Won't release active texture: {texture_id}")
+                        # Update its last used time to prevent constant warnings
+                        self._texture_tracker[texture_id]['last_used'] = self._frame_counter
+                        continue
+                    
+                    # For other textures, just remove them from the tracker
+                    if texture_id in self._texture_tracker:
+                        print(f"Removing leaked texture {texture_id} from tracker")
+                        del self._texture_tracker[texture_id]
+                        self._total_textures_released += 1
+                
+        # Check if current texture is being properly tracked
+        if (hasattr(self, 'metal_texture') and self.metal_texture and 
+            id(self.metal_texture) not in self._texture_tracker):
+            # Re-register the current texture
+            print("Re-registering current texture in tracker")
+            texture_id = id(self.metal_texture)
+            self._texture_tracker[texture_id] = {
+                'size': getattr(self, '_texture_dimensions', (0, 0)),
+                'created_at': self._frame_counter,
+                'last_used': self._frame_counter
+            }
+        
+        # Perform a full memory analysis every 5 major cleanups (roughly every 5 minutes)
+        if self._frame_counter % (5 * 2640) < 60:  # 2640 frames = 60 seconds at 44fps
+            self._analyze_memory()
+                    
+        # Force garbage collection
+        gc.collect()
+        
+        # Log memory usage after cleanup
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            print(f"Memory usage after cleanup: {current_usage_mb:.2f} MB")
+
+    def _analyze_memory(self):
+        """Perform a full memory analysis to diagnose memory issues"""
+        print("============== MEMORY ANALYSIS ==============")
+        
+        # Print current memory usage
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            print(f"Current memory usage: {current_usage_mb:.2f} MB")
+        
+        # Print texture stats
+        if hasattr(self, '_texture_tracker'):
+            active_textures = len(self._texture_tracker)
+            pooled_textures = sum(len(textures) for textures in self._texture_pool.values())
+            print(f"Texture stats: created={self._total_textures_created}, "
+                  f"released={self._total_textures_released}, "
+                  f"active={active_textures}, pooled={pooled_textures}")
+            
+            # Print details of all tracked textures
+            if active_textures > 0:
+                print("Active textures:")
+                for texture_id, info in self._texture_tracker.items():
+                    created_frame = info.get('created_at', 0)
+                    last_used_frame = info.get('last_used', 0)
+                    frames_since_use = self._frame_counter - last_used_frame
+                    size = info.get('size', (0, 0))
+                    print(f"  - ID: {texture_id}, Size: {size[0]}x{size[1]}, "
+                          f"Created at frame: {created_frame}, "
+                          f"Last used: {last_used_frame} ({frames_since_use} frames ago)")
+            
+            # Print pool details
+            if self._texture_pool:
+                print("Texture pools:")
+                for size, textures in self._texture_pool.items():
+                    print(f"  - Size {size[0]}x{size[1]}: {len(textures)} textures")
+        
+        # Check if current texture is properly tracked
+        if hasattr(self, 'metal_texture') and self.metal_texture:
+            texture_id = id(self.metal_texture)
+            is_tracked = texture_id in self._texture_tracker
+            print(f"Current texture (ID: {texture_id}) is {'tracked' if is_tracked else 'NOT TRACKED'}")
+        else:
+            print("No current metal texture")
+        
+        # Print GC stats
+        import gc
+        gc_stats = gc.get_stats()
+        print("Garbage collector stats:")
+        for i, stats in enumerate(gc_stats):
+            print(f"  - Generation {i}: collections={stats['collections']}, "
+                  f"collected={stats.get('collected', 'N/A')}, "
+                  f"uncollectable={stats.get('uncollectable', 'N/A')}")
+        
+        # Run garbage collection and measure memory change
+        if self._psutil_available:
+            before_gc = current_usage_mb
+            gc.collect()
+            mem_info = self._process.memory_info()
+            after_gc = mem_info.rss / (1024 * 1024)
+            print(f"Memory before GC: {before_gc:.2f} MB")
+            print(f"Memory after GC:  {after_gc:.2f} MB")
+            print(f"Memory freed:     {(before_gc - after_gc):.2f} MB")
+        
+        print("=========== END MEMORY ANALYSIS ============")
+
+    def _get_array_from_pool(self, height, width, channels=4, dtype=None):
+        """Get a numpy array from the pool or create a new one if needed"""
+        import numpy as np
+        
+        # Default to uint8 if not specified
+        if dtype is None:
+            dtype = np.uint8
+            
+        # Create the key for this array size
+        key = (height, width, channels, dtype)
+        
+        # Check if we have an array of this size in the pool
+        if key in self._array_pool and self._array_pool[key]:
+            # Get array from pool
+            array = self._array_pool[key].pop()
+            if self._debug_memory and self._frame_counter % 500 == 0:
+                print(f"Reusing array from pool: {key}")
+                
+            # Mark as in use
+            self._array_in_use[id(array)] = key
+            return array
+        else:
+            # Create a new array
+            array = np.zeros((height, width, channels), dtype=dtype)
+            
+            # Mark as in use
+            self._array_in_use[id(array)] = key
+            
+            if self._debug_memory and self._frame_counter % 500 == 0:
+                print(f"Created new array: {key}")
+            return array
+    
+    def _return_array_to_pool(self, array):
+        """Return a numpy array to the pool for reuse"""
+        if array is None:
+            return
+            
+        # Get the array ID
+        array_id = id(array)
+        
+        # Check if this array is marked as in use
+        if array_id in self._array_in_use:
+            # Get the array dimensions
+            key = self._array_in_use[array_id]
+            
+            # Remove from in-use tracking
+            del self._array_in_use[array_id]
+            
+            # Initialize pool for this size if needed
+            if key not in self._array_pool:
+                self._array_pool[key] = []
+                
+            # Check if we're under the pool size limit
+            if len(self._array_pool[key]) < self._max_array_pool_size:
+                # Zero the array to ensure we're not keeping references to old data
+                array.fill(0)
+                
+                # Add to pool
+                self._array_pool[key].append(array)
+                
+                if self._debug_memory and self._frame_counter % 500 == 0:
+                    print(f"Returned array to pool: {key}")
+            else:
+                # Just let it be garbage collected
+                if self._debug_memory and self._frame_counter % 500 == 0:
+                    print(f"Pool full, releasing array: {key}")
+    
+    def _trim_array_pool(self):
+        """Trim the array pool to remove excess arrays"""
+        # Remove excess arrays from the pool
+        for key, arrays in list(self._array_pool.items()):
+            # Keep only the maximum allowed number of arrays per size
+            while len(arrays) > self._max_array_pool_size:
+                arrays.pop(0)  # Remove the oldest array
+                
+        # Log pool status
+        if self._debug_memory:
+            total_arrays = sum(len(arrays) for arrays in self._array_pool.values())
+            in_use = len(self._array_in_use)
+            print(f"Array pool stats: pooled={total_arrays}, in_use={in_use}")
+    
+    def _cleanup_array_pool(self):
+        """Clear the entire array pool"""
+        self._array_pool.clear()
+        # Don't clear _array_in_use as those arrays are still being referenced
+
+    def _synchronize_pools_with_gc(self):
+        """Synchronize object pools with the garbage collector to prevent leaks"""
+        import gc
+        
+        # Get current reference counts for objects
+        texture_refs = {}
+        array_refs = {}
+        
+        # Check texture references
+        for size, textures in list(self._texture_pool.items()):
+            for texture in textures:
+                texture_id = id(texture)
+                texture_refs[texture_id] = sys.getrefcount(texture) - 3  # Account for this function's refs
+                
+        # Check array references
+        for key, arrays in list(self._array_pool.items()):
+            for array in arrays:
+                array_id = id(array)
+                array_refs[array_id] = sys.getrefcount(array) - 3  # Account for this function's refs
+        
+        # Force a garbage collection
+        gc.collect()
+        
+        # Log any objects with unexpected reference counts
+        problematic_textures = []
+        for texture_id, ref_count in texture_refs.items():
+            if ref_count > 1:  # Should only have one reference (in our pool)
+                problematic_textures.append(texture_id)
+                
+        problematic_arrays = []
+        for array_id, ref_count in array_refs.items():
+            if ref_count > 1:  # Should only have one reference (in our pool)
+                problematic_arrays.append(array_id)
+                
+        if problematic_textures:
+            print(f"WARNING: Found {len(problematic_textures)} textures with multiple references")
+            
+        if problematic_arrays:
+            print(f"WARNING: Found {len(problematic_arrays)} arrays with multiple references")
+            
+        # Every 10 minutes, do a deeper check and cleanup
+        if self._frame_counter % 26400 == 0:  # ~10 minutes at 44fps
+            print("Performing deep pool synchronization...")
+            
+            # Clean up texture pool entries that have problematic reference counts
+            for size, textures in list(self._texture_pool.items()):
+                self._texture_pool[size] = [t for t in textures if id(t) not in problematic_textures]
+                
+            # Clean up array pool entries that have problematic reference counts  
+            for key, arrays in list(self._array_pool.items()):
+                self._array_pool[key] = [a for a in arrays if id(a) not in problematic_arrays]
+        
+        # Return number of problematic objects found
+        return len(problematic_textures) + len(problematic_arrays)
 
 class MainWindow(QMainWindow):
     """
