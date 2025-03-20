@@ -100,6 +100,14 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     MAC_ARCH=$(detect_mac_architecture)
     echo -e "${GREEN}Detected Mac architecture: $MAC_ARCH${NC}"
     
+    # Check macOS version (Syphon-python requires macOS 10.9 or above)
+    MACOS_VERSION=$(sw_vers -productVersion)
+    if [[ "$(printf '%s\n' "10.9" "$MACOS_VERSION" | sort -V | head -n1)" != "10.9" ]]; then
+        echo -e "${RED}Syphon-python requires macOS 10.9 or above.${NC}"
+        echo -e "${RED}Current macOS version: $MACOS_VERSION${NC}"
+        exit 1
+    fi
+    
     # Check for Xcode Command Line Tools
     if ! command -v xcode-select &> /dev/null; then
         echo -e "${RED}Xcode Command Line Tools are required but not found.${NC}"
@@ -111,7 +119,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     # Check for Metal framework
     if [ ! -d "/System/Library/Frameworks/Metal.framework" ]; then
         echo -e "${RED}Metal framework is required but not found.${NC}"
-        echo -e "${RED}Please ensure you're running macOS 10.11 or later.${NC}"
+        echo -e "${RED}Please ensure you're running macOS 10.9 or later.${NC}"
         exit 1
     fi
     
@@ -119,7 +127,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     if [ "$MAC_ARCH" = "intel" ]; then
         if [ ! -d "/System/Library/Frameworks/OpenGL.framework" ]; then
             echo -e "${RED}OpenGL framework is required for Intel Macs but not found.${NC}"
-            echo -e "${RED}Please ensure you're running macOS 10.11 or later.${NC}"
+            echo -e "${RED}Please ensure you're running macOS 10.9 or later.${NC}"
             exit 1
         fi
     fi
@@ -170,55 +178,95 @@ PyYAML>=6.0
 pyobjc>=10.0,<11.0  # Ensure compatible version for syphon-python
 pyopengl>=3.1.7
 psutil>=5.9.0  # For memory monitoring
+opencv-python>=4.8.0  # Required for Syphon examples
 EOF
 echo -e "${GREEN}Requirements file created.${NC}"
 
 # Install requirements
 echo -e "${YELLOW}Installing required dependencies from requirements file...${NC}"
 pip install -r requirements.txt
-echo -e "${GREEN}Dependencies installed.${NC}"
-
-# Install syphon-python from source
-echo -e "${YELLOW}Installing syphon-python from source...${NC}"
-
-# Uninstall syphon first if it exists to avoid conflicts
-if python -c "import syphon" 2>/dev/null; then
-    echo -e "${YELLOW}Found existing syphon-python installation. Removing to avoid conflicts...${NC}"
-    pip uninstall -y syphon-python
-    echo -e "${GREEN}Existing syphon-python removed.${NC}"
+if [ $? -ne 0 ]; then
+    echo -e "${RED}Failed to install dependencies.${NC}"
+    echo -e "${YELLOW}Trying alternative installation method...${NC}"
+    
+    # Try installing packages one by one
+    pip install PyQt6>=6.4.0
+    pip install numpy>=1.23.0
+    pip install PyYAML>=6.0
+    pip install "pyobjc>=10.0,<11.0"
+    pip install pyopengl>=3.1.7
+    pip install psutil>=5.9.0
+    pip install opencv-python>=4.8.0
 fi
 
-# Check if syphon-python repo exists
-if [ ! -d "syphon-python" ]; then
-    echo -e "${YELLOW}Cloning syphon-python repository...${NC}"
-    git clone https://github.com/cansik/syphon-python.git
-    echo -e "${GREEN}syphon-python repository cloned.${NC}"
+# Install syphon-python
+echo -e "${YELLOW}Installing syphon-python...${NC}"
+
+# First try installing from PyPI
+echo -e "${YELLOW}Attempting to install syphon-python from PyPI...${NC}"
+pip install syphon-python
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}syphon-python installed successfully from PyPI.${NC}"
 else
-    echo -e "${YELLOW}Updating syphon-python repository...${NC}"
-    cd syphon-python
-    git pull
-    cd ..
-    echo -e "${GREEN}syphon-python repository updated.${NC}"
-fi
-
-# For Intel Macs, we need to ensure we're using the correct branch or version
-if [[ "$OSTYPE" == "darwin"* ]] && [ "$MAC_ARCH" = "intel" ]; then
-    echo -e "${YELLOW}Configuring syphon-python for Intel Mac...${NC}"
-    cd syphon-python
-    # Check if we're on the right branch for Intel Mac support
-    if git branch --contains HEAD | grep -q "intel-mac"; then
-        echo -e "${GREEN}Already on Intel Mac compatible branch.${NC}"
-    else
-        echo -e "${YELLOW}Switching to Intel Mac compatible branch...${NC}"
-        git checkout intel-mac || git checkout master
+    echo -e "${YELLOW}PyPI installation failed, building from source...${NC}"
+    
+    # Clone the repository if it doesn't exist
+    if [ ! -d "syphon-python" ]; then
+        echo -e "${YELLOW}Cloning syphon-python repository...${NC}"
+        git clone https://github.com/cansik/syphon-python.git
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}Failed to clone syphon-python repository.${NC}"
+            echo -e "${YELLOW}Please check your internet connection and try again.${NC}"
+            deactivate
+            exit 1
+        fi
     fi
-    cd ..
-fi
 
-# Install syphon-python in development mode
-echo -e "${YELLOW}Installing syphon-python in development mode...${NC}"
-pip install -e syphon-python --no-deps  # Install without dependencies to avoid conflicts
-echo -e "${GREEN}syphon-python installed.${NC}"
+    # Navigate to the syphon-python directory
+    cd syphon-python
+
+    # Build the wheel
+    echo -e "${YELLOW}Building syphon-python wheel...${NC}"
+    pip install build
+    python -m build --wheel
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to build syphon-python wheel.${NC}"
+        echo -e "${YELLOW}Please check the build logs for more information.${NC}"
+        cd ..
+        deactivate
+        exit 1
+    fi
+
+    # Find and install the wheel
+    echo -e "${YELLOW}Installing syphon-python wheel...${NC}"
+    WHEEL_FILE=$(ls dist/syphon_python-0.1.1-*.whl)
+    if [ -z "$WHEEL_FILE" ]; then
+        echo -e "${RED}No wheel file found in dist directory.${NC}"
+        cd ..
+        deactivate
+        exit 1
+    fi
+
+    # Copy wheel to project root for future use
+    cp "$WHEEL_FILE" ../syphon_python_wheel.whl
+    echo -e "${YELLOW}Wheel file saved as syphon_python_wheel.whl for future use${NC}"
+
+    # Install the wheel
+    pip install "$WHEEL_FILE"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to install syphon-python wheel.${NC}"
+        echo -e "${YELLOW}Please check the installation logs for more information.${NC}"
+        cd ..
+        deactivate
+        exit 1
+    fi
+
+    # Return to the project root
+    cd ..
+    echo -e "${GREEN}syphon-python built and installed successfully from wheel.${NC}"
+    echo -e "${YELLOW}Note: If you encounter memory issues, you can try reinstalling the wheel:${NC}"
+    echo -e "${YELLOW}source venv/bin/activate && pip install syphon_python_wheel.whl && deactivate${NC}"
+fi
 
 # Make sure resources directories exist
 echo -e "${YELLOW}Checking resources directories...${NC}"
@@ -236,6 +284,7 @@ verify_package "PyYAML" "yaml" || DEPS_OK=false
 verify_package "syphon-python" "syphon" || DEPS_OK=false
 verify_package "psutil" "psutil" || DEPS_OK=false
 verify_package "pyobjc" "objc" || DEPS_OK=false
+verify_package "opencv-python" "cv2" || DEPS_OK=false
 
 # Check tracemalloc (built-in module)
 if python -c "import tracemalloc" 2>/dev/null; then
@@ -264,7 +313,6 @@ if [ $? -ne 0 ]; then
     # This is a simplified attempt to fix conflicts - in complex cases, manual intervention might be needed
     echo -e "${YELLOW}Running pip install to resolve dependencies...${NC}"
     pip install -r requirements.txt --upgrade
-    pip install -e syphon-python --no-deps  # Reinstall syphon without deps
 else
     echo -e "${GREEN}No dependency conflicts detected.${NC}"
 fi

@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QToolBar, QStatusBar, QMenuBar, QMenu, QDialog, QSizePolicy, QGroupBox, QHBoxLayout,
     QSpinBox, QPushButton, QCheckBox, QListWidget, QListWidgetItem
 )
-from PyQt6.QtGui import QPainter, QColor, QPixmap, QAction
+from PyQt6.QtGui import QPainter, QColor, QPixmap, QAction, QImage
 from PyQt6.QtCore import Qt, QTimer, QRect, QByteArray, QSize, QSettings
 import gc
 import psutil
@@ -108,8 +108,17 @@ class CanvasWidget(QWidget):
         self._last_memory_check = 0
         self._memory_check_interval = 10  # Check memory every 10 frames
         
+        # Initialize Metal flag
+        self.using_metal = False
+        
         # Initialize Syphon
         self.init_syphon()
+        
+        # Check which Syphon methods are available (for debugging)
+        self._check_syphon_methods()
+        
+        # Show detailed server information
+        self._show_syphon_info()
         
         # Create canvas update timer
         self.update_timer = QTimer(self)
@@ -149,55 +158,235 @@ class CanvasWidget(QWidget):
         self.update_canvas()
 
     def init_syphon(self):
-        """Initialize the Syphon server"""
+        """Initialize Syphon server for frame sharing"""
         try:
-            # Check if Metal is available
-            metal_available = 'Metal' in sys.modules
+            # Import Syphon
+            import syphon
             
-            # Create and start Syphon server
-            if metal_available and hasattr(syphon, 'SyphonMetalServer'):
+            # Initialize _objc_utils regardless of Syphon mode
+            self._objc_utils = None
+            self._init_ns_image_converter()
+            
+            # Detect which Syphon implementation is being used
+            print(f"Syphon module found: {syphon.__name__}")
+            print(f"Syphon version: {getattr(syphon, '__version__', 'unknown')}")
+            print(f"Available Syphon attributes: {dir(syphon)}")
+            
+            # Try to use Metal first
+            if hasattr(syphon, 'SyphonMetalServer'):
+                print("Attempting to use syphon-python Metal implementation")
                 try:
-                    # Create Metal device first and validate
+                    import Metal
                     self.metal_device = Metal.MTLCreateSystemDefaultDevice()
                     if not self.metal_device:
-                        print("Warning: Failed to create Metal device, falling back to legacy server")
-                        raise RuntimeError("Failed to create Metal device")
+                        print("No Metal device available, will try OpenGL")
+                        raise ImportError("Metal device not available")
                     
-                    # Create Syphon server with error checking
-                    self.server = syphon.SyphonMetalServer("ArtNet Visualizer")
-                    if not self.server:
-                        print("Warning: Failed to create Metal Syphon server, falling back to legacy server")
-                        raise RuntimeError("Failed to create Syphon server")
-                        
-                    print("Syphon server started (Metal interface)")
-                    self.using_metal = True
-                except Exception as metal_error:
-                    print(f"Metal initialization failed: {metal_error}")
-                    # Fall back to legacy server if Metal fails
-                    if hasattr(syphon, 'SyphonServer'):
-                        self.server = syphon.SyphonServer()
-                        self.server.start(name="ArtNet Visualizer", dimensions=(512, 10))
-                        print("Syphon server started (legacy interface)")
-                        self.using_metal = False
+                    # Create command queue
+                    self.metal_command_queue = self.metal_device.newCommandQueue()
+                    if not self.metal_command_queue:
+                        print("Failed to create Metal command queue")
+                        raise ImportError("Metal command queue creation failed")
+                    
+                    # Create Metal server
+                    self.server = syphon.SyphonMetalServer("ArtNetViz Syphon", 
+                                                          device=self.metal_device, 
+                                                          command_queue=self.metal_command_queue)
+                    
+                    # Test if the server is working
+                    if hasattr(self.server, 'publish'):
+                        try:
+                            self.server.publish()
+                            print("Metal server publish test passed")
+                            self.using_metal = True
+                            print("Metal-based Syphon server initialized successfully")
+                        except Exception as e:
+                            print(f"Metal server publish test failed: {e}")
+                            raise ImportError("Metal server publish test failed")
                     else:
-                        print("Warning: No supported Syphon implementation available")
-                        self.server = None
-                        self.using_metal = False
-            elif hasattr(syphon, 'SyphonServer'):
-                # Use legacy Syphon server
-                self.server = syphon.SyphonServer()
-                self.server.start(name="ArtNet Visualizer", dimensions=(512, 10))
-                print("Syphon server started (legacy interface)")
-                self.using_metal = False
-            else:
-                print("Warning: No supported Syphon implementation found")
-                self.server = None
-                self.using_metal = False
-        except Exception as e:
-            print(f"Error initializing Syphon: {e}")
+                        print("Metal server lacks publish method")
+                        raise ImportError("Metal server lacks required methods")
+                        
+                except (ImportError, AttributeError, Exception) as e:
+                    print(f"Metal initialization failed: {str(e)}")
+                    print("Will try OpenGL next")
+                    self.using_metal = False
+                    self.server = None
+            
+            # Try OpenGL if Metal failed or wasn't available
+            if not self.server and hasattr(syphon, 'SyphonOpenGLServer'):
+                print("Attempting to use syphon-python OpenGL implementation")
+                try:
+                    self.server = syphon.SyphonOpenGLServer("ArtNetViz Syphon")
+                    self.using_metal = False
+                    print("OpenGL-based Syphon server initialized")
+                except Exception as e:
+                    print(f"OpenGL Syphon initialization failed: {e}")
+                    self.server = None
+            
+            # If we couldn't initialize either Metal or OpenGL properly, disable Syphon
+            if not self.server:
+                print("Could not initialize any Syphon server implementation")
+                raise ImportError("No suitable Syphon server implementation")
+            
+            # Initialize array for direct numpy publishing
+            self._syphon_array = None
+            self._syphon_array_dims = None
+            
+            # Log available methods for debugging
+            self._check_syphon_methods()
+            
+            # Show detailed server information
+            self._show_syphon_info()
+            
+        except ImportError as e:
+            print(f"Syphon not available - sharing disabled: {str(e)}")
             self.server = None
             self.using_metal = False
-            # Don't raise the exception - allow the app to continue without Syphon
+        except Exception as e:
+            print(f"Error initializing Syphon: {str(e)}")
+            self.server = None
+            self.using_metal = False
+            
+        # Log available methods for debugging
+        if self.server is not None:
+            self._check_syphon_methods()
+            
+            # Show detailed server information
+            self._show_syphon_info()
+  
+    def _init_ns_image_converter(self):
+        """Initialize the NSImage converter for OpenGL mode"""
+        try:
+            # Import required Objective-C libraries
+            from objc import objc_object
+            from Foundation import NSImage, NSBitmapImageRep
+            import Cocoa
+            
+            self._objc_utils = {
+                'NSImage': NSImage,
+                'NSBitmapImageRep': NSBitmapImageRep,
+                'Cocoa': Cocoa
+            }
+            print("NSImage converter initialized successfully")
+        except Exception as e:
+            print(f"Error initializing NSImage converter: {str(e)}")
+            self._objc_utils = None
+
+    def _qimage_to_nsimage(self, qimage):
+        """Convert a QImage to NSImage for Syphon compatibility"""
+        # Initialize _objc_utils if it doesn't exist
+        if not hasattr(self, '_objc_utils') or self._objc_utils is None:
+            self._init_ns_image_converter()
+        
+        # Check again after initialization attempt
+        if not self._objc_utils:
+            print("No _objc_utils available, NSImage conversion failed")
+            return None
+        
+        try:
+            # Get image dimensions
+            width = qimage.width()
+            height = qimage.height()
+            
+            # Get raw image data
+            bits = qimage.bits()
+            bits.setsize(qimage.sizeInBytes())
+            
+            # Convert QImage to proper format if needed
+            if qimage.format() != QImage.Format.Format_ARGB32:
+                qimage = qimage.convertToFormat(QImage.Format.Format_ARGB32)
+                bits = qimage.bits()
+                bits.setsize(qimage.sizeInBytes())
+            
+            # Create NSBitmapImageRep
+            NSBitmapImageRep = self._objc_utils['NSBitmapImageRep']
+            bitmap = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+                None, width, height, 8, 4, True, False, 
+                self._objc_utils['Cocoa'].NSDeviceRGBColorSpace, 
+                width * 4, 32
+            )
+            
+            # Copy data from QImage to bitmap with explicit size check
+            bitmap_data = bitmap.bitmapData()
+            buffer_size = width * height * 4
+            
+            # Make sure we're not trying to copy more data than QImage has
+            qimage_size = qimage.sizeInBytes()
+            if buffer_size > qimage_size:
+                print(f"Warning: NSImage buffer size ({buffer_size}) exceeds QImage size ({qimage_size})")
+                buffer_size = qimage_size
+                
+            # Copy ARGB data to NSBitmapImageRep
+            memoryview(bitmap_data)[:buffer_size] = memoryview(bits)[:buffer_size]
+            
+            # Create NSImage from bitmap
+            NSImage = self._objc_utils['NSImage']
+            ns_image = NSImage.alloc().initWithSize_((width, height))
+            ns_image.addRepresentation_(bitmap)
+            
+            # Log success
+            if self._frame_counter % 300 == 0:
+                print(f"Successfully created NSImage of size {width}x{height}")
+                
+            return ns_image
+        except Exception as e:
+            print(f"Error converting QImage to NSImage: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _init_metal_texture(self):
+        """Initialize the Metal texture for Syphon output"""
+        if not self.using_metal or not hasattr(self, 'metal_device'):
+            return
+            
+        try:
+            # Get the actual dimensions - use default if pixmap not yet created
+            if hasattr(self, 'full_res_pixmap') and self.full_res_pixmap and not self.full_res_pixmap.isNull():
+                width = self.full_res_pixmap.width()
+                height = self.full_res_pixmap.height()
+            else:
+                width = 512
+                height = 10
+            
+            # Check if we already have a valid texture with the correct dimensions
+            if (hasattr(self, 'metal_texture') and self.metal_texture and 
+                hasattr(self.metal_texture, 'width') and hasattr(self.metal_texture, 'height') and
+                self.metal_texture.width == width and self.metal_texture.height == height):
+                # Texture already exists with correct dimensions, no need to recreate
+                return
+            
+            # Create texture descriptor - use correct method for setting properties
+            descriptor = Metal.MTLTextureDescriptor.alloc().init()
+            # Use setPixelFormat_ instead of direct assignment
+            descriptor.setPixelFormat_(80)  # BGRA8Unorm = 80 in Metal
+            descriptor.setWidth_(width)
+            descriptor.setHeight_(height)
+            descriptor.setMipmapLevelCount_(1)
+            descriptor.setUsage_(7)  # renderTarget(1) | shaderRead(2) | shaderWrite(4) = 7
+            
+            # Create texture
+            self.metal_texture = self.metal_device.newTextureWithDescriptor_(descriptor)
+            if not self.metal_texture:
+                raise RuntimeError("Failed to create Metal texture")
+            
+            # Log success but less frequently to avoid log spam
+            if self._frame_counter % 300 == 0:
+                print(f"Metal texture initialized successfully with dimensions {width}x{height}")
+        except Exception as e:
+            print(f"Error initializing Metal texture: {e}")
+            import traceback
+            traceback.print_exc()
+            if hasattr(self, 'metal_texture'):
+                del self.metal_texture
+            self.metal_texture = None
+            # Fall back to legacy mode
+            self.using_metal = False
+            if hasattr(self, 'metal_device'):
+                del self.metal_device
+            if hasattr(self, 'metal_command_queue'):
+                del self.metal_command_queue
 
     def set_frame_rate(self, fps):
         """Set the frame rate for canvas updates"""
@@ -330,6 +519,16 @@ class CanvasWidget(QWidget):
                 full_res_painter.end()
                 painter.end()
                 
+                # After creating/updating full_res_pixmap, initialize or update Metal texture if needed
+                if self.using_metal and hasattr(self, 'metal_device'):
+                    if not hasattr(self, 'metal_texture') or self.metal_texture is None:
+                        self._init_metal_texture()
+                    elif hasattr(self, 'full_res_pixmap') and self.full_res_pixmap:
+                        # Check if dimensions changed and we need to recreate texture
+                        if (self.full_res_pixmap.width() != self.metal_texture.width or 
+                            self.full_res_pixmap.height() != self.metal_texture.height):
+                            self._init_metal_texture()
+                
                 # Update Syphon frame
                 self.update_syphon_frame()
                 
@@ -337,7 +536,6 @@ class CanvasWidget(QWidget):
                 self.update()
                 
                 # Periodic cleanup and memory check
-                self._frame_counter += 1
                 if self._frame_counter % 60 == 0:
                     # Clear caches periodically to prevent memory growth
                     self._color_cache.clear()
@@ -368,125 +566,198 @@ class CanvasWidget(QWidget):
         elif self.verbose:
             print("No universes found. Canvas not updated.")
     
+    def _validate_frame_data(self, frame_width, frame_height):
+        """Validate frame dimensions and check if there's actual content to display"""
+        if frame_width <= 0 or frame_height <= 0:
+            if self._frame_counter % 60 == 0:
+                print(f"Invalid frame dimensions: {frame_width}x{frame_height}")
+            return False
+            
+        # Check if there are any universes to display
+        if len(self.artnet_listener.universes) == 0:
+            if self._frame_counter % 60 == 0:
+                print("No universes to display")
+            return False
+            
+        # Check if at least one universe has data
+        has_data = False
+        for universe in self.artnet_listener.universes:
+            if self.artnet_listener.get_buffer(universe) is not None:
+                has_data = True
+                break
+                
+        if not has_data and self._frame_counter % 60 == 0:
+            print("No DMX data available in any universe")
+            
+        return has_data
+    
     def update_syphon_frame(self):
-        """Update Syphon server with full-resolution pixmap content"""
-        if not self.server or not self.full_res_pixmap:
-            return
+        """Update the Syphon frame with current canvas content"""
+        # Always increment frame counter whether or not server exists
+        self._frame_counter += 1
         
+        if not self.server:
+            return
+            
         try:
-            # Always use the full resolution pixmap for Syphon output
-            image = self.full_res_pixmap.toImage()
-            if not image:
-                print("Warning: Failed to convert pixmap to image")
+            # Check which Syphon implementation we're using
+            import syphon
+            
+            # Get pixmap dimensions
+            if self.full_res_pixmap and not self.full_res_pixmap.isNull():
+                width = self.full_res_pixmap.width()
+                height = self.full_res_pixmap.height()
+                
+                # Only log occasionally to reduce console spam
+                if self._frame_counter % 300 == 0:
+                    print(f"Publishing frame with dimensions: {width}x{height}")
+            else:
+                width = 512
+                height = 10
+                if self._frame_counter % 60 == 0:
+                    print(f"Using default dimensions: {width}x{height}")
+            
+            # Validate frame data
+            if not self._validate_frame_data(width, height):
                 return
-                
-            # Verify dimensions will work with Metal texture limits (16384 max)
-            width = min(image.width(), 16384)  # Limit to max Metal texture size
-            height = min(image.height(), 16384)  # Limit to max Metal texture size
             
-            # If image is larger than Metal texture limits, create a scaled version
-            if width < image.width() or height < image.height():
-                print(f"WARNING: Image dimensions ({image.width()}x{image.height()}) exceed Metal texture limits. Scaling to {width}x{height}")
-                image = image.scaled(width, height, aspectRatioMode=Qt.AspectRatioMode.KeepAspectRatio)
-            
-            # Check if we need to update the cached array
-            if (self._syphon_array is None or 
-                self._syphon_array_dims != (width, height)):
-                
-                # Convert QImage to NumPy array for Syphon
-                ptr = image.bits()
-                if not ptr:
-                    print("Warning: Failed to get image bits")
-                    return
-                    
-                ptr.setsize(height * width * 4)
-                self._syphon_array = np.frombuffer(ptr, np.uint8).reshape((height, width, 4))
-                self._syphon_array_dims = (width, height)
-                
-                # Flip the image vertically for Syphon (corrects the upside-down issue)
-                self._syphon_array = np.flip(self._syphon_array, axis=0)
-            else:
-                # Update existing array with new data
-                ptr = image.bits()
-                if not ptr:
-                    print("Warning: Failed to get image bits")
-                    return
-                    
-                ptr.setsize(height * width * 4)
-                np.copyto(self._syphon_array, np.frombuffer(ptr, np.uint8).reshape((height, width, 4)))
-                self._syphon_array = np.flip(self._syphon_array, axis=0)
-            
+            # Metal-based Syphon publishing
             if self.using_metal:
-                # Metal-based Syphon server with texture caching
                 try:
-                    if (not hasattr(self, 'cached_mtl_texture') or self.cached_mtl_texture is None or
-                        not hasattr(self, 'cached_mtl_texture_dims') or self.cached_mtl_texture_dims != (width, height)):
-                        if hasattr(self, 'cached_mtl_texture') and self.cached_mtl_texture is not None:
-                            try:
-                                del self.cached_mtl_texture
-                            except:
-                                pass
-                                
-                        # Validate Metal device before creating texture
-                        if not hasattr(self, 'metal_device') or not self.metal_device:
-                            print("Warning: Metal device not available")
-                            return
-                            
-                        self.cached_mtl_texture = create_mtl_texture(device=self.metal_device, width=width, height=height)
-                        if not self.cached_mtl_texture:
-                            print("Warning: Failed to create Metal texture")
-                            return
-                            
-                        self.cached_mtl_texture_dims = (width, height)
-                        
-                    # Copy image data to texture
-                    try:
-                        copy_image_to_mtl_texture(self._syphon_array, self.cached_mtl_texture)
-                    except Exception as copy_error:
-                        print(f"Error copying image to Metal texture: {copy_error}")
-                        return
-                        
-                    # Publish frame
-                    try:
-                        self.server.publish_frame_texture(self.cached_mtl_texture)
-                    except Exception as publish_error:
-                        print(f"Error publishing frame: {publish_error}")
-                        return
-                        
-                except Exception as e:
-                    print(f"Error in Metal Syphon update: {e}")
-                    # Try fallback to legacy mode if Metal fails
-                    self.using_metal = False
-                    if hasattr(self.server, 'publish_frame_nparray'):
+                    # Log occasionally
+                    if self._frame_counter % 300 == 0:
+                        print(f"Publishing Metal frame with dimensions: {width}x{height}")
+                    
+                    # Make sure we have a valid texture
+                    if not hasattr(self, 'metal_texture') or self.metal_texture is None:
+                        self._init_metal_texture()
+                    elif (hasattr(self, 'metal_texture') and 
+                          (self.metal_texture.width != width or self.metal_texture.height != height)):
+                        # Dimensions changed, recreate texture
+                        self._init_metal_texture()
+                    
+                    # Copy pixmap data to metal texture
+                    if hasattr(self, 'metal_texture') and self.metal_texture and self.full_res_pixmap:
                         try:
-                            self.server.publish_frame_nparray(self._syphon_array, (width, height))
-                        except Exception as legacy_error:
-                            print(f"Legacy fallback also failed: {legacy_error}")
-            else:
-                # Legacy Syphon server
-                try:
-                    self.server.publish_frame_nparray(self._syphon_array, (width, height))
+                            # Convert QPixmap to QImage in RGBA format
+                            image = self.full_res_pixmap.toImage()
+                            image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+                            
+                            # Alternative approach using direct pixel data access
+                            import numpy as np
+                            from syphon.utils.numpy import copy_image_to_mtl_texture
+                            
+                            # Create a numpy array from the QImage using QImage's data access methods
+                            width = image.width()
+                            height = image.height()
+                            
+                            # Create a numpy array to store the pixel data
+                            pixels = np.zeros((height, width, 4), dtype=np.uint8)
+                            
+                            # Copy pixel data manually
+                            for y in range(height):
+                                for x in range(width):
+                                    color = image.pixelColor(x, y)
+                                    pixels[y, x, 0] = color.red()
+                                    pixels[y, x, 1] = color.green()
+                                    pixels[y, x, 2] = color.blue()
+                                    pixels[y, x, 3] = color.alpha()
+                            
+                            # Copy the numpy array to the metal texture
+                            copy_image_to_mtl_texture(pixels, self.metal_texture)
+                            
+                            # Create a command buffer to publish the texture
+                            command_buffer = self.metal_command_queue.commandBuffer()
+                            command_buffer.setLabel_("ArtNetViz Publish Command Buffer")
+                            
+                            # Publish the texture
+                            if hasattr(self.server, 'publish_frame_texture'):
+                                self.server.publish_frame_texture(
+                                    self.metal_texture,
+                                    region=(0, 0, width, height),
+                                    command_buffer=command_buffer
+                                )
+                                if self._frame_counter % 300 == 0:
+                                    print("Metal frame published using publish_frame_texture")
+                            elif hasattr(self.server, 'publish'):
+                                # If using newer API, the texture should be automatically published
+                                self.server.publish()
+                                if self._frame_counter % 300 == 0:
+                                    print("Metal frame published using publish()")
+                            else:
+                                if self._frame_counter % 300 == 0:
+                                    print("Metal server lacks publish methods - no frame published")
+                                    
+                        except Exception as e:
+                            print(f"Error copying data to Metal texture: {e}")
+                            import traceback
+                            traceback.print_exc()
                 except Exception as e:
-                    print(f"Error updating legacy Syphon: {e}")
-                    # Try fallback using texture creation
-                    try:
-                        if hasattr(self.server, 'device'):
-                            texture = create_mtl_texture(device=self.server.device, width=width, height=height)
-                            if texture:
-                                copy_image_to_mtl_texture(self._syphon_array, texture)
-                                self.server.publish_frame_texture(texture)
-                                del texture  # Free texture reference
-                    except Exception as fallback_e:
-                        print(f"Fallback Syphon update also failed: {fallback_e}")
+                    print(f"Error copying data to Metal texture: {e}")
+                    import traceback
+                    traceback.print_exc()
+            # OpenGL publishing
+            elif not self.using_metal:
+                if self.full_res_pixmap and not self.full_res_pixmap.isNull():
+                    # Convert QPixmap to QImage
+                    image = self.full_res_pixmap.toImage()
+                    if not image.isNull():
+                        try:
+                            # Convert to RGB32 format
+                            image = image.convertToFormat(QImage.Format.Format_RGB32)
+                            
+                            # Get dimensions
+                            size = image.size()
+                            width = size.width()
+                            height = size.height()
+                            
+                            # Try the NSImage approach - simplify to focus on just this method which is most likely to work
+                            published = False
+                            ns_image = self._qimage_to_nsimage(image)
+                            if ns_image is not None:
+                                # Try publishImage_ first (Objective-C style) then fallback to others
+                                try:
+                                    if hasattr(self.server, 'publishImage_'):
+                                        self.server.publishImage_(ns_image)
+                                        published = True
+                                        if self._frame_counter % 300 == 0:
+                                            print("Published using publishImage_ method")
+                                    elif hasattr(self.server, 'publish_frame_image'):
+                                        self.server.publish_frame_image(ns_image)
+                                        published = True
+                                        if self._frame_counter % 300 == 0:
+                                            print("Published using publish_frame_image method")
+                                    elif hasattr(self.server, 'publish_image'):
+                                        self.server.publish_image(ns_image)
+                                        published = True
+                                        if self._frame_counter % 300 == 0:
+                                            print("Published using publish_image method")
+                                    elif hasattr(self.server, 'publish_nsimage'):
+                                        self.server.publish_nsimage(ns_image)
+                                        published = True
+                                        if self._frame_counter % 300 == 0:
+                                            print("Published using publish_nsimage method")
+                                    elif hasattr(self.server, 'publish_texture'):
+                                        self.server.publish_texture(ns_image)
+                                        published = True
+                                        if self._frame_counter % 300 == 0:
+                                            print("Published using publish_texture method")
+                                    
+                                    # If we successfully published, log it once but don't log every frame
+                                    if published and (self._frame_counter % 300 == 0):
+                                        print(f"Successfully published NSImage to Syphon: {width}x{height}")
+                                except Exception as e:
+                                    print(f"NSImage publishing failed: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                        except Exception as e:
+                            print(f"Error in Syphon publishing: {str(e)}")
+                            import traceback
+                            traceback.print_exc()
         except Exception as e:
-            print(f"Error in update_syphon_frame: {e}")
-        finally:
-            # Clean up temporary objects
-            if 'image' in locals():
-                del image
-            if 'ptr' in locals():
-                del ptr
-            gc.collect()
+            print(f"Error in update_syphon_frame: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def paintEvent(self, event):
         """Paint the canvas on the widget"""
@@ -535,75 +806,204 @@ class CanvasWidget(QWidget):
     
     def cleanup(self):
         """Clean up resources"""
-        # Safely stop the timer
-        if hasattr(self, 'update_timer') and self.update_timer is not None:
-            try:
-                if self.update_timer.isActive():
-                    self.update_timer.stop()
-            except RuntimeError:
-                # Ignore RuntimeError if the timer has already been deleted
-                pass
-            except Exception as e:
-                print(f"Error stopping timer: {e}")
-            finally:
-                del self.update_timer
-        
-        # Clean up painters
-        if self._painter is not None:
-            try:
-                self._painter.end()
-            except:
-                pass
-            del self._painter
-        
-        if self._full_res_painter is not None:
-            try:
-                self._full_res_painter.end()
-            except:
-                pass
-            del self._full_res_painter
-        
-        # Clean up pixmaps
-        if hasattr(self, '_full_res_pixmap'):
-            del self._full_res_pixmap
-        
-        if hasattr(self, 'full_res_pixmap'):
-            del self.full_res_pixmap
-        
-        if hasattr(self, 'pixmap'):
-            del self.pixmap
+        try:
+            # Stop the update timer
+            if hasattr(self, 'update_timer') and self.update_timer:
+                self.update_timer.stop()
             
-        # Clean up Metal textures
-        if hasattr(self, 'cached_mtl_texture') and self.cached_mtl_texture is not None:
-            try:
-                del self.cached_mtl_texture
-            except:
-                pass
-                
-        if hasattr(self, 'cached_mtl_texture_dims'):
-            del self.cached_mtl_texture_dims
-            
-        # Clean up Metal device
-        if hasattr(self, 'metal_device'):
-            del self.metal_device
-        
-        # Force a garbage collection
-        gc.collect()
-        
-        if self.server:
-            try:
-                if hasattr(self.server, 'stop'):
+            # Clean up Syphon resources
+            if hasattr(self, 'server') and self.server:
+                try:
                     self.server.stop()
-                print("Syphon server stopped")
-            except Exception as e:
-                print(f"Error stopping Syphon server: {e}")
+                except Exception as e:
+                    print(f"Error stopping Syphon server: {e}")
+                finally:
+                    self.server = None
+            
+            # Clean up Metal resources
+            if self.using_metal:
+                if hasattr(self, 'metal_texture') and self.metal_texture:
+                    try:
+                        del self.metal_texture
+                    except Exception as e:
+                        print(f"Error cleaning up Metal texture: {e}")
+                    finally:
+                        self.metal_texture = None
                 
-        # Final cleanup
-        gc.collect()
+                if hasattr(self, 'metal_command_queue') and self.metal_command_queue:
+                    try:
+                        del self.metal_command_queue
+                    except Exception as e:
+                        print(f"Error cleaning up Metal command queue: {e}")
+                    finally:
+                        self.metal_command_queue = None
+                
+                if hasattr(self, 'metal_device') and self.metal_device:
+                    try:
+                        del self.metal_device
+                    except Exception as e:
+                        print(f"Error cleaning up Metal device: {e}")
+                    finally:
+                        self.metal_device = None
+            
+            # Clean up pixmaps
+            if hasattr(self, 'pixmap') and self.pixmap:
+                try:
+                    del self.pixmap
+                except Exception as e:
+                    print(f"Error cleaning up pixmap: {e}")
+                finally:
+                    self.pixmap = None
+            
+            if hasattr(self, 'full_res_pixmap') and self.full_res_pixmap:
+                try:
+                    del self.full_res_pixmap
+                except Exception as e:
+                    print(f"Error cleaning up full_res_pixmap: {e}")
+                finally:
+                    self.full_res_pixmap = None
+            
+            # Clean up painters
+            if hasattr(self, '_painter') and self._painter:
+                try:
+                    del self._painter
+                except Exception as e:
+                    print(f"Error cleaning up painter: {e}")
+                finally:
+                    self._painter = None
+            
+            if hasattr(self, '_full_res_painter') and self._full_res_painter:
+                try:
+                    del self._full_res_painter
+                except Exception as e:
+                    print(f"Error cleaning up full_res_painter: {e}")
+                finally:
+                    self._full_res_painter = None
+            
+            # Clean up caches
+            if hasattr(self, '_color_cache'):
+                self._color_cache.clear()
+            if hasattr(self, '_coordinate_cache'):
+                self._coordinate_cache.clear()
+            
+            # Clean up Syphon array
+            if hasattr(self, '_syphon_array'):
+                self._syphon_array = None
+            if hasattr(self, '_syphon_array_dims'):
+                self._syphon_array_dims = None
+            
+            # Force garbage collection
+            gc.collect()
+            
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+        finally:
+            # Reset flags
+            self.using_metal = False
 
     def __del__(self):
         """Clean up resources when object is deleted"""
         self.cleanup()
+
+    def _check_syphon_methods(self):
+        """Check which methods are available on the Syphon server object"""
+        if not hasattr(self, 'server') or self.server is None:
+            print("No Syphon server available")
+            return
+            
+        try:
+            # Log the server class type
+            server_class = self.server.__class__.__name__
+            print(f"Syphon server class: {server_class}")
+            
+            # Get all methods on the server object
+            methods = [method for method in dir(self.server) if not method.startswith('_')]
+            print(f"Available Syphon methods: {', '.join(methods)}")
+            
+            # Check for specific publishing methods
+            publish_methods = [m for m in methods if 'publish' in m.lower()]
+            if publish_methods:
+                print(f"Publishing methods: {', '.join(publish_methods)}")
+                for method in publish_methods:
+                    try:
+                        # Get method signature if possible
+                        import inspect
+                        signature = inspect.signature(getattr(self.server, method))
+                        print(f"  - {method}{signature}")
+                    except:
+                        print(f"  - {method} (signature unknown)")
+            else:
+                print("No publishing methods found!")
+                
+        except Exception as e:
+            print(f"Error checking Syphon methods: {str(e)}")
+
+    def _show_syphon_info(self):
+        """Show detailed information about the Syphon server for debugging"""
+        if not hasattr(self, 'server') or self.server is None:
+            print("No Syphon server available")
+            return
+            
+        try:
+            # Output header
+            print("\n=== SYPHON SERVER INFORMATION ===")
+            
+            # Server type
+            server_class = self.server.__class__.__name__
+            print(f"Server class: {server_class}")
+            
+            # Server details
+            if hasattr(self.server, 'serverName'):
+                print(f"Server name: {self.server.serverName}")
+            if hasattr(self.server, 'description'):
+                print(f"Description: {self.server.description}")
+                
+            # List all attributes
+            print("\nAll attributes:")
+            for attr in dir(self.server):
+                if not attr.startswith('__'):
+                    value = getattr(self.server, attr)
+                    if callable(value):
+                        print(f"  {attr}() [method]")
+                    else:
+                        print(f"  {attr} = {value}")
+            
+            # Try to get information about publish methods
+            print("\nDetailed publish methods:")
+            publish_methods = [m for m in dir(self.server) if 'publish' in m.lower() and callable(getattr(self.server, m))]
+            
+            if publish_methods:
+                import inspect
+                for method in publish_methods:
+                    try:
+                        func = getattr(self.server, method)
+                        sig = inspect.signature(func)
+                        print(f"  {method}{sig}")
+                        
+                        # Try to get docstring
+                        if func.__doc__:
+                            print(f"    Documentation: {func.__doc__.strip()}")
+                    except Exception as e:
+                        print(f"  {method} - Error getting details: {e}")
+            else:
+                print("  No publish methods found")
+                
+            # Test publish method directly
+            try:
+                print("\nTesting publish method...")
+                if hasattr(self.server, 'publish') and callable(self.server.publish):
+                    self.server.publish()
+                    print("Server publish() method called successfully")
+            except Exception as e:
+                print(f"Error calling publish() method: {e}")
+                import traceback
+                traceback.print_exc()
+                
+            print("=================================")
+        except Exception as e:
+            print(f"Error showing Syphon info: {e}")
+            import traceback
+            traceback.print_exc()
 
 class MainWindow(QMainWindow):
     """
@@ -1340,5 +1740,5 @@ def show_memory_snapshot():
 
 def log_memory(message=""):
     process = psutil.Process()
-    mem_mb = process.memory_info().rss / (1024*1024)
+    mem_mb = process.memory_info().rss / (1024 * 1024)
     print(f"[MEMORY] {message}: {mem_mb:.2f} MB") 

@@ -185,6 +185,16 @@ EOF
     
     # Clean up
     rm $TEMP_FILE
+
+elif [ "$1" == "--debug-syphon" ]; then
+    echo -e "${YELLOW}Running Syphon debug client...${NC}"
+    echo -e "${GREEN}First, make sure your main application is running in another terminal${NC}"
+    echo -e "${GREEN}with: ./run.sh${NC}"
+    echo -e "${YELLOW}This client will connect to your Syphon server and display frames${NC}"
+    
+    # Run the debug client
+    python debug_syphon.py
+    EXIT_CODE=$?
 else
     # Run the application normally without any debug flags
     PYTHONPATH=src python src/main.py
@@ -209,6 +219,7 @@ if [ $EXIT_CODE -ne 0 ]; then
     echo -e "${YELLOW}   - Network settings via Settings > Settings menu${NC}"
     echo -e "${YELLOW}5. Run with memory monitoring: ./run.sh --monitor${NC}"
     echo -e "${YELLOW}6. Run with debug hooks: ./run.sh --debug-script${NC}"
+    echo -e "${YELLOW}7. Debug Syphon frames: ./run.sh --debug-syphon${NC}"
 else
     echo -e "${GREEN}Application exited successfully.${NC}"
 fi
