@@ -27,13 +27,28 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QMessageBox, QLabel,
     QToolBar, QStatusBar, QMenuBar, QMenu, QDialog, QSizePolicy, QGroupBox, QHBoxLayout,
-    QSpinBox, QPushButton, QCheckBox, QListWidget, QListWidgetItem
+    QSpinBox, QPushButton, QCheckBox, QListWidget, QListWidgetItem, QSlider, QComboBox,
+    QFileDialog, QLineEdit, QFormLayout
 )
 from PyQt6.QtGui import QPainter, QColor, QPixmap, QAction, QImage
 from PyQt6.QtCore import Qt, QTimer, QRect, QByteArray, QSize, QSettings
 import gc
 import psutil
 import tracemalloc
+import json
+import atexit
+import objc
+from objc import YES, NO
+import Foundation
+from Foundation import NSMakePoint, NSMakeSize, NSMakeRect
+import Metal
+import typing
+import socket
+import ipaddress
+import re
+import traceback
+from datetime import datetime
+from enum import Enum
 
 import syphon
 from syphon.utils.numpy import copy_image_to_mtl_texture
@@ -878,57 +893,38 @@ class CanvasWidget(QWidget):
                             else:
                                 # If direct buffer access fails, log once per session
                                 if not hasattr(self, '_buffer_access_failed'):
+                                    print("Warning: Failed to access QImage buffer directly")
                                     self._buffer_access_failed = True
-                                    print("Warning: Direct buffer access failed, using fallback method")
+                            
+                            # Publish the frame - using the simplest API possible
+                            try:
+                                # Use the simplest form of the API
+                                if hasattr(self.server, 'publish_frame_texture'):
+                                    self.server.publish_frame_texture(
+                                        texture=self.metal_texture, 
+                                        is_flipped=True  # Explicitly set is_flipped parameter
+                                    )
                                     
-                                # Create the buffer once and reuse it
-                                if not hasattr(self, '_pixel_buffer') or self._pixel_buffer is None or self._pixel_buffer.shape != (height, width, 4):
-                                    self._pixel_buffer = np.zeros((height, width, 4), dtype=np.uint8)
-                                
-                                # Pixel-by-pixel copy is slower but more reliable
-                                for y in range(height):
-                                    for x in range(width):
-                                        color = image.pixelColor(x, y)
-                                        self._pixel_buffer[y, x, 0] = color.red()
-                                        self._pixel_buffer[y, x, 1] = color.green()
-                                        self._pixel_buffer[y, x, 2] = color.blue()
-                                        self._pixel_buffer[y, x, 3] = color.alpha()
-                                
-                                # Copy to texture
-                                copy_image_to_mtl_texture(self._pixel_buffer, self.metal_texture)
-                            
-                            # Create a new command buffer for each frame
-                            command_buffer = self.metal_command_queue.commandBuffer()
-                            
-                            # Publish the frame
-                            if hasattr(self.server, 'publish_frame_texture'):
-                                self.server.publish_frame_texture(
-                                    self.metal_texture,
-                                    region=(0, 0, width, height),
-                                    command_buffer=command_buffer
-                                )
-                                if self._frame_counter % 300 == 0:
-                                    print("Frame published using publish_frame_texture")
-                            else:
-                                self.server.publish()
-                                if self._frame_counter % 300 == 0:
-                                    print("Frame published using publish()")
+                                    # Log occasionally
+                                    if self._frame_counter % 300 == 0:
+                                        print(f"Metal frame published: {width}x{height}")
+                                else:
+                                    # Fallback to simple publish
+                                    self.server.publish()
                                     
-                            # Force buffer release and cleanup
-                            del command_buffer
-                            
-                            # Clean up local variables explicitly
-                            del buffer
-                            del image
-                            
+                                    if self._frame_counter % 300 == 0:
+                                        print("Using basic publish() method")
+                            except Exception as e:
+                                print(f"Error in frame publishing: {e}")
+                                
                         except Exception as e:
-                            if self._frame_counter % 300 == 0:
-                                print(f"Error publishing frame: {e}")
-                                
+                            if self._frame_counter % 60 == 0:
+                                print(f"Error in Metal texture data handling: {e}")
+                                if hasattr(self, 'metal_texture'):
+                                    print(f"Metal texture exists: {self.metal_texture is not None}")
                 except Exception as e:
-                    if self._frame_counter % 300 == 0:
-                        print(f"Error in Metal publishing: {e}")
-                    
+                    print(f"Error in Metal publishing: {e}")
+            
             # OpenGL publishing
             elif not self.using_metal:
                 # OpenGL implementation similar to before...
