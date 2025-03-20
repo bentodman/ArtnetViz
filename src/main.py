@@ -48,6 +48,9 @@ except ImportError:
 from artnet_listener import ArtNetListener
 from artnet_test_source import ArtNetTestSource, PatternType
 
+# Import shared configuration
+from config import DEBUG_MEMORY
+
 # Import our settings dialog
 from settings_dialog import SettingsDialog, load_config_from_file
 
@@ -58,9 +61,6 @@ try:
 except ImportError:
     MEMORY_TRACKING_AVAILABLE = False
     
-# Global flag for enabling additional memory debugging
-DEBUG_MEMORY = False
-
 # Determine if we're running as a standalone app or not
 def get_resource_path(relative_path):
     """Get the correct resource path whether running as script or frozen app"""
@@ -160,11 +160,13 @@ class CanvasWidget(QWidget):
                     # Create Metal device first and validate
                     self.metal_device = Metal.MTLCreateSystemDefaultDevice()
                     if not self.metal_device:
+                        print("Warning: Failed to create Metal device, falling back to legacy server")
                         raise RuntimeError("Failed to create Metal device")
                     
                     # Create Syphon server with error checking
                     self.server = syphon.SyphonMetalServer("ArtNet Visualizer")
                     if not self.server:
+                        print("Warning: Failed to create Metal Syphon server, falling back to legacy server")
                         raise RuntimeError("Failed to create Syphon server")
                         
                     print("Syphon server started (Metal interface)")
@@ -178,7 +180,9 @@ class CanvasWidget(QWidget):
                         print("Syphon server started (legacy interface)")
                         self.using_metal = False
                     else:
-                        raise RuntimeError("No supported Syphon implementation available")
+                        print("Warning: No supported Syphon implementation available")
+                        self.server = None
+                        self.using_metal = False
             elif hasattr(syphon, 'SyphonServer'):
                 # Use legacy Syphon server
                 self.server = syphon.SyphonServer()
@@ -186,7 +190,7 @@ class CanvasWidget(QWidget):
                 print("Syphon server started (legacy interface)")
                 self.using_metal = False
             else:
-                print("No supported Syphon implementation found")
+                print("Warning: No supported Syphon implementation found")
                 self.server = None
                 self.using_metal = False
         except Exception as e:
@@ -341,16 +345,17 @@ class CanvasWidget(QWidget):
                     gc.collect()
                     
                     # Log memory usage every 60 frames
-                    process = psutil.Process()
-                    memory_info = process.memory_info()
-                    memory_mb = memory_info.rss / (1024 * 1024)
-                    print(f"[DEBUG-MEM] Memory usage at frame {self._frame_counter}: {memory_mb:.2f} MB")
-                    if tracemalloc.is_tracing():
-                        snapshot = tracemalloc.take_snapshot()
-                        top_stats = snapshot.statistics('lineno')
-                        print(f"[DEBUG-MEM] Top 5 memory allocations at frame {self._frame_counter}:")
-                        for stat in top_stats[:5]:
-                            print(f"[DEBUG-MEM] {stat}")
+                    if DEBUG_MEMORY:
+                        process = psutil.Process()
+                        memory_info = process.memory_info()
+                        memory_mb = memory_info.rss / (1024 * 1024)
+                        print(f"[DEBUG-MEM] Memory usage at frame {self._frame_counter}: {memory_mb:.2f} MB")
+                        if tracemalloc.is_tracing():
+                            snapshot = tracemalloc.take_snapshot()
+                            top_stats = snapshot.statistics('lineno')
+                            print(f"[DEBUG-MEM] Top 5 memory allocations at frame {self._frame_counter}:")
+                            for stat in top_stats[:5]:
+                                print(f"[DEBUG-MEM] {stat}")
             finally:
                 # Ensure painters are properly cleaned up
                 if full_res_painter.isActive():
@@ -1258,7 +1263,8 @@ def main():
             fps=frame_rate,  # Use the frame rate from config
             speed=speed
         )
-        print(f"Using Art-Net test source with pattern: {pattern_str}")
+        if DEBUG_MEMORY:
+            print(f"Using Art-Net test source with pattern: {pattern_str}")
     else:
         # Create standard Art-Net listener
         data_source = ArtNetListener(
@@ -1266,7 +1272,8 @@ def main():
             port=artnet_config.get('port', 6454),
             universes=universes
         )
-        print("Using standard Art-Net listener")
+        if DEBUG_MEMORY:
+            print("Using standard Art-Net listener")
     
     # Start the data source
     data_source.start()

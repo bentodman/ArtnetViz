@@ -79,6 +79,9 @@ echo ""
 if [ "$1" == "--monitor" ]; then
     echo -e "${YELLOW}Running with memory monitoring in background...${NC}"
     
+    # Install psutil if needed for monitoring
+    pip install psutil
+    
     # Create a temp script for monitoring
     cat > monitor_memory.py << 'EOF'
 import psutil
@@ -114,8 +117,8 @@ with open(log_file, 'w') as f:
             break
 EOF
     
-    # Run the app normally
-    python src/main.py &
+    # Run the app without debug memory flag
+    PYTHONPATH=src python src/main.py &
     APP_PID=$!
     
     # Run the monitor in background
@@ -183,8 +186,8 @@ EOF
     # Clean up
     rm $TEMP_FILE
 else
-    # Run the application normally
-    python src/main.py
+    # Run the application normally without any debug flags
+    PYTHONPATH=src python src/main.py
     EXIT_CODE=$?
 fi
 
