@@ -49,6 +49,7 @@ Run the application:
 - Syphon integration for macOS
 - DMX recording and playback functionality
 - Test pattern generator for offline testing
+- macOS App Nap prevention for consistent background performance
 
 ## Requirements
 

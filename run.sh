@@ -12,6 +12,22 @@ echo -e "${BLUE}=========================================${NC}"
 echo -e "${BLUE}   ArtNetViz Runner                     ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
+# Detect if running on macOS
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # Check if caffeinate is available (macOS utility to prevent system sleep)
+    if command -v caffeinate &> /dev/null; then
+        echo -e "${GREEN}Detected macOS: Enabling system-level App Nap prevention...${NC}"
+        # This will run our Python app with caffeinate to prevent system sleep and App Nap
+        USE_CAFFEINATE=true
+    else
+        echo -e "${YELLOW}Warning: caffeinate not found on macOS. System-level App Nap prevention disabled.${NC}"
+        echo -e "${YELLOW}The application will still use internal App Nap prevention via NSProcessInfo.${NC}"
+        USE_CAFFEINATE=false
+    fi
+else
+    USE_CAFFEINATE=false
+fi
+
 # Check if Python is installed
 if ! command -v python3 &> /dev/null; then
     echo -e "${RED}Python 3 is required but not found. Please install Python 3 and try again.${NC}"
@@ -197,7 +213,12 @@ elif [ "$1" == "--debug-syphon" ]; then
     EXIT_CODE=$?
 else
     # Run the application normally without any debug flags
-    PYTHONPATH=src python src/main.py
+    if [ "$USE_CAFFEINATE" = true ]; then
+        echo -e "${GREEN}Running with caffeinate to prevent App Nap...${NC}"
+        caffeinate -d -i -m -s PYTHONPATH=src python src/main.py
+    else
+        PYTHONPATH=src python src/main.py
+    fi
     EXIT_CODE=$?
 fi
 
@@ -220,6 +241,8 @@ if [ $EXIT_CODE -ne 0 ]; then
     echo -e "${YELLOW}5. Run with memory monitoring: ./run.sh --monitor${NC}"
     echo -e "${YELLOW}6. Run with debug hooks: ./run.sh --debug-script${NC}"
     echo -e "${YELLOW}7. Debug Syphon frames: ./run.sh --debug-syphon${NC}"
+    echo -e "${YELLOW}8. On macOS, performance issues when app is in background might be related to App Nap.${NC}"
+    echo -e "${YELLOW}   The app automatically prevents this, but you can also run with: USE_CAFFEINATE=true ./run.sh${NC}"
 else
     echo -e "${GREEN}Application exited successfully.${NC}"
 fi

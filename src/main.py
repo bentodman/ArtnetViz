@@ -24,19 +24,55 @@ import time
 import signal
 import yaml
 import numpy as np
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QMessageBox, QLabel,
-    QToolBar, QStatusBar, QMenuBar, QMenu, QDialog, QSizePolicy, QGroupBox, QHBoxLayout,
-    QSpinBox, QPushButton, QCheckBox, QListWidget, QListWidgetItem, QSlider, QComboBox,
-    QFileDialog, QLineEdit, QFormLayout
-)
-from PyQt6.QtGui import QPainter, QColor, QPixmap, QAction, QImage
-from PyQt6.QtCore import Qt, QTimer, QRect, QByteArray, QSize, QSettings
-import gc
 import psutil
 import tracemalloc
-import json
+import gc
+import traceback
 import atexit
+from typing import Optional, List, Dict, Tuple, Any, Union
+
+# Disable App Nap on macOS to prevent the app from being throttled when in the background
+if sys.platform == 'darwin':
+    try:
+        from Foundation import NSProcessInfo
+        process_info = NSProcessInfo.processInfo()
+        # Save activity reference as a global to prevent it from being garbage collected
+        # Using NSActivityUserInitiated | NSActivityLatencyCritical for maximum prevention
+        global _app_nap_activity
+        _app_nap_activity = process_info.beginActivityWithOptions_reason_(
+            0x00FFFFFF,  # NSActivityUserInitiated | NSActivityLatencyCritical
+            "ArtNetViz requires full performance even in the background"
+        )
+        print("App Nap disabled successfully")
+    except Exception as e:
+        print(f"Could not disable App Nap: {e}")
+        print("Continuing with App Nap enabled - may experience performance issues when app is in background")
+
+# Continue with the rest of the imports
+try:
+    from PyQt6.QtWidgets import (
+        QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
+        QWidget, QPushButton, QComboBox, QCheckBox, QTabWidget,
+        QGridLayout, QSlider, QSpinBox, QDoubleSpinBox, QScrollArea,
+        QSplitter, QToolBar, QStatusBar, QLineEdit, QDialog, QMenu, 
+        QFileDialog, QColorDialog, QMessageBox, QGroupBox, QSizePolicy,
+        QListWidget, QListWidgetItem
+    )
+    from PyQt6.QtGui import (
+        QPixmap, QPainter, QColor, QPen, QBrush, QCursor, QFont,
+        QAction, QIcon, QImage, QKeySequence, QPalette, QTransform
+    )
+    from PyQt6.QtCore import (
+        Qt, QTimer, QSize, QPoint, QRect, QObject, pyqtSignal, 
+        QEvent, QMimeData, QBuffer, QIODevice, QByteArray,
+        QMetaObject, QSettings, QUrl
+    )
+except ImportError:
+    print("ERROR: PyQt6 is required to run this application.")
+    print("Please install it with: pip install PyQt6")
+    sys.exit(1)
+
+import json
 import objc
 from objc import YES, NO
 import Foundation
@@ -46,7 +82,6 @@ import typing
 import socket
 import ipaddress
 import re
-import traceback
 from datetime import datetime
 from enum import Enum
 
@@ -65,6 +100,27 @@ from artnet_test_source import ArtNetTestSource, PatternType
 
 # Import shared configuration
 from config import DEBUG_MEMORY
+
+# Global variables
+_app_nap_activity = None  # Will hold the NSActivity reference for App Nap prevention
+
+def cleanup_app_nap():
+    """Release the App Nap activity object when the application is exiting."""
+    global _app_nap_activity
+    if _app_nap_activity is not None:
+        try:
+            # Properly end the activity before releasing the reference
+            NSProcessInfo.processInfo().endActivity_(_app_nap_activity)
+            _app_nap_activity = None
+            print("App Nap activity released properly")
+        except Exception as e:
+            print(f"Error releasing App Nap activity: {e}")
+            # Fallback - delete the reference
+            del _app_nap_activity
+            _app_nap_activity = None
+
+# Register the cleanup function to be called on exit
+atexit.register(cleanup_app_nap)
 
 # Import our settings dialog
 from settings_dialog import SettingsDialog, load_config_from_file
