@@ -3,3 +3,4 @@ numpy>=1.23.0
 PyYAML>=6.0
 pyobjc>=10.0,<11.0  # Ensure compatible version for syphon-python
 pyopengl>=3.1.7
+psutil>=5.9.0  # For memory monitoring
