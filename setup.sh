@@ -178,7 +178,6 @@ PyYAML>=6.0
 pyobjc>=10.0,<11.0  # Ensure compatible version for syphon-python
 pyopengl>=3.1.7
 psutil>=5.9.0  # For memory monitoring
-opencv-python>=4.8.0  # Required for Syphon examples
 EOF
 echo -e "${GREEN}Requirements file created.${NC}"
 
@@ -196,7 +195,6 @@ if [ $? -ne 0 ]; then
     pip install "pyobjc>=10.0,<11.0"
     pip install pyopengl>=3.1.7
     pip install psutil>=5.9.0
-    pip install opencv-python>=4.8.0
 fi
 
 # Install syphon-python
@@ -284,7 +282,6 @@ verify_package "PyYAML" "yaml" || DEPS_OK=false
 verify_package "syphon-python" "syphon" || DEPS_OK=false
 verify_package "psutil" "psutil" || DEPS_OK=false
 verify_package "pyobjc" "objc" || DEPS_OK=false
-verify_package "opencv-python" "cv2" || DEPS_OK=false
 
 # Check tracemalloc (built-in module)
 if python -c "import tracemalloc" 2>/dev/null; then
