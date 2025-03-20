@@ -4,9 +4,9 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
+dist/
 downloads/
 eggs/
 .eggs/
@@ -20,15 +20,26 @@ wheels/
 .installed.cfg
 *.egg
 
-# PyInstaller
-*.manifest
-*.spec
+# Environments
+env/
+venv/
+venv_build/
+ENV/
+.env
+.venv
+
+# Logs and databases
+*.log
+*.csv
+*.sqlite
+*.sqlite3
+*.db
 
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Unit test / coverage reports
+# Unit tests and coverage
 htmlcov/
 .tox/
 .coverage
@@ -38,18 +49,23 @@ nosetests.xml
 coverage.xml
 *.cover
 .hypothesis/
+pytest_cache/
+.pytest_cache/
 
-# Virtual environments
-venv/
-venv_build/
-ENV/
+# Build tools
+*.manifest
+*.spec
+build_*/
+dist_*/
 
+# IDE specific files
 # PyCharm
 .idea/
 *.iml
-
 # VSCode
 .vscode/
+# Cursor
+.cursor/
 
 # macOS
 .DS_Store
@@ -65,13 +81,15 @@ Icon
 .VolumeIcon.icns
 .com.apple.timemachine.donotpresent
 
-# Application specific
-build_*/
-dist_*/
-*.log
-*.csv
-.cursor/
-recordings/
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 
-# Except specific resource files
-!resources/icons/*.icns 
+# Application specific
+recordings/
+=*
+syphon-python/
+syphon_python_wheel.whl
+.*.swp
