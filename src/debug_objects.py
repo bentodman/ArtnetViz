@@ -8,6 +8,7 @@ import sys
 import tracemalloc
 import psutil
 import os
+import time
 from collections import Counter
 from PyQt6.QtGui import QPainter, QPixmap
 from PyQt6.QtCore import QTimer, Qt
@@ -21,6 +22,9 @@ class MemoryTracker:
         self.enabled = False
         self.previous_counts = None
         self.start_snapshot = None
+        self.memory_history = []  # Track memory usage over time
+        self.last_check_time = 0
+        self.leak_detection_enabled = False
         self.tracked_types = [
             QPainter, 
             QPixmap, 
@@ -39,6 +43,7 @@ class MemoryTracker:
         tracemalloc.start()
         self.start_snapshot = tracemalloc.take_snapshot()
         self.previous_counts = self._count_objects()
+        self.last_check_time = time.time()
         print("Memory tracking started")
     
     def stop(self):
@@ -59,7 +64,66 @@ class MemoryTracker:
         process = psutil.Process(os.getpid())
         memory_info = process.memory_info()
         memory_mb = memory_info.rss / (1024 * 1024)
+        
+        # Track history
+        now = time.time()
+        self.memory_history.append((now, memory_mb))
+        
+        # Keep only the last 100 entries
+        if len(self.memory_history) > 100:
+            self.memory_history = self.memory_history[-100:]
+        
+        # Check for leaks - memory steadily increasing
+        if self.leak_detection_enabled and len(self.memory_history) > 10:
+            time_diff = now - self.last_check_time
+            if time_diff > 30:  # Check every 30 seconds
+                self.last_check_time = now
+                self._check_for_leaks()
+                
         print(f"Memory usage: {memory_mb:.2f} MB")
+    
+    def _check_for_leaks(self):
+        """Check for possible memory leaks based on history."""
+        if len(self.memory_history) < 10:
+            return
+            
+        # Check if memory has been consistently increasing
+        first_10_avg = sum(mem for _, mem in self.memory_history[:10]) / 10
+        last_10_avg = sum(mem for _, mem in self.memory_history[-10:]) / 10
+        
+        # If memory increased by more than 20% in the monitoring period, warn about potential leak
+        if last_10_avg > first_10_avg * 1.2:
+            print("WARNING: Possible memory leak detected!")
+            print(f"Memory increased from {first_10_avg:.2f} MB to {last_10_avg:.2f} MB")
+            self.print_object_diff()
+            
+            # Get details about large objects
+            self._print_large_objects()
+    
+    def _print_large_objects(self):
+        """Print information about the largest objects in memory."""
+        print("\nLargest objects in memory:")
+        
+        # Get all objects
+        all_objects = gc.get_objects()
+        
+        # Filter for objects that support sys.getsizeof
+        try:
+            objects_with_size = [(obj, sys.getsizeof(obj)) for obj in all_objects 
+                                if hasattr(obj, '__class__')]
+        except:
+            objects_with_size = []
+            
+        # Sort by size (largest first)
+        objects_with_size.sort(key=lambda x: x[1], reverse=True)
+        
+        # Print top 10
+        for i, (obj, size) in enumerate(objects_with_size[:10]):
+            try:
+                type_name = obj.__class__.__name__
+                print(f"  {i+1}. {type_name}: {size/1024:.1f} KB")
+            except:
+                pass
     
     def _count_objects(self):
         """Count objects by type."""
@@ -97,6 +161,11 @@ class MemoryTracker:
         top_stats = current_snapshot.compare_to(self.start_snapshot, 'lineno')
         for stat in top_stats[:10]:
             print(f"  {stat}")
+    
+    def enable_leak_detection(self, enabled=True):
+        """Enable or disable automatic memory leak detection."""
+        self.leak_detection_enabled = enabled
+        print(f"Memory leak detection {'enabled' if enabled else 'disabled'}")
 
 # Create a global instance for use throughout the application
 memory_tracker = MemoryTracker()
@@ -104,6 +173,7 @@ memory_tracker = MemoryTracker()
 def setup_memory_tracking(app):
     """Set up periodic memory tracking in the application."""
     memory_tracker.start()
+    memory_tracker.enable_leak_detection(True)
     
     # Create a timer for periodic tracking
     timer = QTimer()

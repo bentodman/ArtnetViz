@@ -1595,45 +1595,68 @@ class CanvasWidget(QWidget):
             del pool
 
     def _restart_syphon_server(self):
-        """Perform cleanup without restarting the Syphon server."""
+        """Completely restart the Syphon server to mitigate memory leaks in the native framework"""
         from Foundation import NSAutoreleasePool
         
-        # Create autorelease pool for the cleanup operation
+        # Create autorelease pool for the restart operation
         pool = NSAutoreleasePool.alloc().init()
         
         try:
-            print("Performing memory cleanup without restarting Syphon server (client doesn't like restarts)...")
+            print("Performing complete Syphon server restart to mitigate memory leak...")
             
-            # Record the last restart time to prevent too frequent cleanup attempts
+            # Record the last restart time
             self._last_syphon_restart = self._frame_counter
             
-            # Force cleanup of texture resources but don't touch the server
-            self._reset_texture_pool("Memory cleanup")
+            # Stop and release existing Syphon server
+            if hasattr(self, 'server') and self.server:
+                print("Stopping Syphon server...")
+                self.server.stop()
+                self.server = None
+            
+            # Force cleanup of all texture resources
+            self._reset_texture_pool("Syphon restart")
             
             # Force garbage collection
             import gc
             gc.collect()
             
-            # Reset texture tracking variables but keep server
+            # Create new server with fresh Metal context
+            import syphon
+            
             if self.using_metal:
                 try:
-                    # Force texture recreation without server restart
+                    # Import needed libraries
+                    import objc
+                    import Metal
+                    import syphon.utils.numpy
+                    
+                    # Create fresh Metal device and command queue
+                    self.metal_device = Metal.MTLCreateSystemDefaultDevice()
+                    self.metal_command_queue = self.metal_device.newCommandQueue()
+                    
+                    # Create server with Metal backend
+                    self.server = syphon.SyphonMetalServer("ArtNetViz Syphon",
+                                                      self.metal_device,
+                                                      self.metal_command_queue)
+                    
+                    # Reset texture tracking variables
                     self.metal_texture = None
                     self._texture_dimensions = (0, 0)
                     
-                    print("Memory cleanup completed without server restart")
+                    print("Syphon server restarted successfully")
+                    
                 except Exception as e:
-                    print(f"Error during memory cleanup: {e}")
-            
-            # Force another garbage collection
+                    print(f"Error restarting Syphon server: {e}")
+                    
+            # Force another garbage collection after server creation
             gc.collect()
             
-            # Check memory after cleanup
+            # Check memory after restart
             mem_usage = self._get_memory_usage_mb()
-            print(f"Memory usage after cleanup: {mem_usage:.2f} MB")
+            print(f"Memory usage after Syphon restart: {mem_usage:.2f} MB")
             
         except Exception as e:
-            print(f"Error in memory cleanup: {e}")
+            print(f"Error in Syphon server restart: {e}")
         finally:
             # Always release the pool
             del pool
@@ -1838,15 +1861,8 @@ class CanvasWidget(QWidget):
                 # Clean up Syphon frame data
                 self._syphon_array = None
                 self._syphon_array_dims = None
+                        self._total_textures_released += 1
                 
-        except Exception as e:
-            print(f"Error during cleanup: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            # Always release the pool
-            del pool
-            
         # Check if current texture is being properly tracked
         if (hasattr(self, 'metal_texture') and self.metal_texture and 
             id(self.metal_texture) not in self._texture_tracker):
@@ -2115,114 +2131,6 @@ class CanvasWidget(QWidget):
         
         # Return number of problematic objects found
         return len(problematic_textures) + len(problematic_arrays)
-
-    def _check_syphon_methods(self):
-        """Check which methods are available on the Syphon server object"""
-        if not hasattr(self, 'server') or self.server is None:
-            print("No Syphon server available")
-            return
-            
-        try:
-            # Log the server class type
-            server_class = self.server.__class__.__name__
-            print(f"Syphon server class: {server_class}")
-            
-            # Get all methods on the server object
-            methods = [method for method in dir(self.server) if not method.startswith('_')]
-            print(f"Available Syphon methods: {', '.join(methods)}")
-            
-            # Check for specific publishing methods
-            publish_methods = [m for m in methods if 'publish' in m.lower()]
-            if publish_methods:
-                print(f"Publishing methods: {', '.join(publish_methods)}")
-                for method in publish_methods:
-                    try:
-                        # Get method signature if possible
-                        import inspect
-                        signature = inspect.signature(getattr(self.server, method))
-                        print(f"  - {method}{signature}")
-                    except:
-                        print(f"  - {method} (signature unknown)")
-            else:
-                print("No publishing methods found!")
-                
-        except Exception as e:
-            print(f"Error checking Syphon methods: {str(e)}")
-
-    def _show_syphon_info(self):
-        """Show detailed information about the Syphon server for debugging"""
-        if not hasattr(self, 'server') or self.server is None:
-            print("No Syphon server available")
-            return
-            
-        try:
-            # Output header
-            print("\n=== SYPHON SERVER INFORMATION ===")
-            
-            # Server type
-            server_class = self.server.__class__.__name__
-            print(f"Server class: {server_class}")
-            
-            # Server details
-            if hasattr(self.server, 'serverName'):
-                print(f"Server name: {self.server.serverName}")
-            if hasattr(self.server, 'description'):
-                print(f"Description: {self.server.description}")
-                
-            # List all attributes
-            print("\nAll attributes:")
-            for attr in dir(self.server):
-                if not attr.startswith('__'):
-                    value = getattr(self.server, attr)
-                    if callable(value):
-                        print(f"  {attr}() [method]")
-                    else:
-                        print(f"  {attr} = {value}")
-            
-            # Try to get information about publish methods
-            print("\nDetailed publish methods:")
-            publish_methods = [m for m in dir(self.server) if 'publish' in m.lower() and callable(getattr(self.server, m))]
-            
-            if publish_methods:
-                import inspect
-                for method in publish_methods:
-                    try:
-                        func = getattr(self.server, method)
-                        sig = inspect.signature(func)
-                        print(f"  {method}{sig}")
-                        
-                        # Try to get docstring
-                        if func.__doc__:
-                            print(f"    Documentation: {func.__doc__.strip()}")
-                    except Exception as e:
-                        print(f"  {method} - Error getting details: {e}")
-            else:
-                print("  No publish methods found")
-                
-            # Test publish method directly
-            try:
-                print("\nTesting publish method...")
-                if hasattr(self.server, 'publish') and callable(self.server.publish):
-                    self.server.publish()
-                    print("Server publish() method called successfully")
-            except Exception as e:
-                print(f"Error calling publish() method: {e}")
-                import traceback
-                traceback.print_exc()
-                
-            print("=================================")
-        except Exception as e:
-            print(f"Error showing Syphon info: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _get_memory_usage_mb(self):
-        """Get current memory usage in MB"""
-        if self._psutil_available:
-            mem_info = self._process.memory_info()
-            return mem_info.rss / (1024 * 1024)
-        else:
-            return 0
 
 class MainWindow(QMainWindow):
     """

@@ -1,0 +1,492 @@
+    def cleanup(self):
+        """Clean up all resources before the application exits."""
+        print("Starting full application cleanup...")
+        
+        # Create an autorelease pool
+        from Foundation import NSAutoreleasePool
+        import gc
+        pool = NSAutoreleasePool.alloc().init()
+        
+        try:
+            # Stop Syphon server
+            if hasattr(self, 'server') and self.server:
+                print("Stopping Syphon server...")
+                self.server.stop()
+                self.server = None
+                
+            # Stop update timer
+            if hasattr(self, 'update_timer') and self.update_timer:
+                print("Stopping update timer...")
+                self.update_timer.stop()
+                self.update_timer = None
+                
+            # Stop Syphon timer
+            if hasattr(self, 'syphon_timer') and self.syphon_timer:
+                print("Stopping Syphon timer...")
+                self.syphon_timer.stop()
+                self.syphon_timer = None
+                
+            # Clean up Metal resources
+            if hasattr(self, 'using_metal') and self.using_metal:
+                print("Cleaning up Metal resources...")
+                
+                # Clean up texture pool
+                if hasattr(self, '_texture_pool'):
+                    pool_count = sum(len(textures) for textures in self._texture_pool.values())
+                    print(f"Cleaning up texture pool with {pool_count} textures")
+                    
+                    for size, textures in list(self._texture_pool.items()):
+                        while textures:
+                            texture = textures.pop()
+                            self._safely_release_texture(texture)
+                    
+                    self._texture_pool.clear()
+                
+                # Release the current texture
+                if hasattr(self, 'metal_texture') and self.metal_texture:
+                    print(f"Releasing texture {id(self.metal_texture)} - was tracked: {id(self.metal_texture) in self._texture_tracker}")
+                    self._safely_release_texture(self.metal_texture)
+                    self.metal_texture = None
+                    
+                # Clear any remaining tracked textures
+                if hasattr(self, '_texture_tracker'):
+                    for texture_id in list(self._texture_tracker.keys()):
+                        print(f"Cleaning up tracked texture {texture_id}")
+                        del self._texture_tracker[texture_id]
+                    self._texture_tracker.clear()
+                
+                # Release Metal device and command queue if needed
+                if hasattr(self, 'metal_command_queue'):
+                    self.metal_command_queue = None
+                
+                if hasattr(self, 'metal_device'):
+                    self.metal_device = None
+            
+            # Clean up numpy array pool
+            if hasattr(self, '_array_pool'):
+                array_count = sum(len(arrays) for arrays in self._array_pool.values())
+                print(f"Cleaning up array pool with {array_count} arrays")
+                self._cleanup_array_pool()
+                
+            # Clean up in-use array tracking
+            if hasattr(self, '_array_in_use'):
+                print(f"Clearing {len(self._array_in_use)} in-use array references")
+                self._array_in_use.clear()
+            
+            # Clean up pixmaps
+            print("Cleaning up pixmaps...")
+            if hasattr(self, 'pixmap') and self.pixmap:
+                self.pixmap = None
+            if hasattr(self, 'full_res_pixmap') and self.full_res_pixmap:
+                self.full_res_pixmap = None
+            
+            # Clean up Syphon
+            if hasattr(self, 'syphon_available') and self.syphon_available:
+                print("Cleaning up Syphon resources...")
+                self.syphon_available = False
+                self.server = None
+                self.syphon_timer = None
+                
+                # Clean up Syphon client
+                if hasattr(self, 'syphon_client'):
+                    self.syphon_client.stop()
+                    self.syphon_client = None
+                
+                # Clean up Syphon server
+                if hasattr(self, 'syphon_server'):
+                    self.syphon_server.stop()
+                    self.syphon_server = None
+                
+                # Clean up Syphon connection
+                if hasattr(self, 'syphon_connection'):
+                    self.syphon_connection.close()
+                    self.syphon_connection = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                
+                # Clean up Syphon frame data
+                self._syphon_array = None
+                self._syphon_array_dims = None
+                        self._total_textures_released += 1
+                
+        # Check if current texture is being properly tracked
+        if (hasattr(self, 'metal_texture') and self.metal_texture and 
+            id(self.metal_texture) not in self._texture_tracker):
+            # Re-register the current texture
+            print("Re-registering current texture in tracker")
+            texture_id = id(self.metal_texture)
+            self._texture_tracker[texture_id] = {
+                'size': getattr(self, '_texture_dimensions', (0, 0)),
+                'created_at': self._frame_counter,
+                'last_used': self._frame_counter
+            }
+        
+        # Perform a full memory analysis every 5 major cleanups (roughly every 5 minutes)
+        if self._frame_counter % (5 * 2640) < 60:  # 2640 frames = 60 seconds at 44fps
+            self._analyze_memory()
+                    
+        # Force garbage collection
+        gc.collect()
+        
+        # Log memory usage after cleanup
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            print(f"Memory usage after cleanup: {current_usage_mb:.2f} MB")
+
+    def _analyze_memory(self):
+        """Perform a full memory analysis to diagnose memory issues"""
+        print("============== MEMORY ANALYSIS ==============")
+        
+        # Print current memory usage
+        if self._psutil_available:
+            mem_info = self._process.memory_info()
+            current_usage_mb = mem_info.rss / (1024 * 1024)
+            print(f"Current memory usage: {current_usage_mb:.2f} MB")
+        
+        # Print texture stats
+        if hasattr(self, '_texture_tracker'):
+            active_textures = len(self._texture_tracker)
+            pooled_textures = sum(len(textures) for textures in self._texture_pool.values())
+            print(f"Texture stats: created={self._total_textures_created}, "
+                  f"released={self._total_textures_released}, "
+                  f"active={active_textures}, pooled={pooled_textures}")
+            
+            # Print details of all tracked textures
+            if active_textures > 0:
+                print("Active textures:")
+                for texture_id, info in self._texture_tracker.items():
+                    created_frame = info.get('created_at', 0)
+                    last_used_frame = info.get('last_used', 0)
+                    frames_since_use = self._frame_counter - last_used_frame
+                    size = info.get('size', (0, 0))
+                    print(f"  - ID: {texture_id}, Size: {size[0]}x{size[1]}, "
+                          f"Created at frame: {created_frame}, "
+                          f"Last used: {last_used_frame} ({frames_since_use} frames ago)")
+            
+            # Print pool details
+            if self._texture_pool:
+                print("Texture pools:")
+                for size, textures in self._texture_pool.items():
+                    print(f"  - Size {size[0]}x{size[1]}: {len(textures)} textures")
+        
+        # Check if current texture is properly tracked
+        if hasattr(self, 'metal_texture') and self.metal_texture:
+            texture_id = id(self.metal_texture)
+            is_tracked = texture_id in self._texture_tracker
+            print(f"Current texture (ID: {texture_id}) is {'tracked' if is_tracked else 'NOT TRACKED'}")
+        else:
+            print("No current metal texture")
+        
+        # Print GC stats
+        import gc
+        gc_stats = gc.get_stats()
+        print("Garbage collector stats:")
+        for i, stats in enumerate(gc_stats):
+            print(f"  - Generation {i}: collections={stats['collections']}, "
+                  f"collected={stats.get('collected', 'N/A')}, "
+                  f"uncollectable={stats.get('uncollectable', 'N/A')}")
+        
+        # Run garbage collection and measure memory change
+        if self._psutil_available:
+            before_gc = current_usage_mb
+            gc.collect()
+            mem_info = self._process.memory_info()
+            after_gc = mem_info.rss / (1024 * 1024)
+            print(f"Memory before GC: {before_gc:.2f} MB")
+            print(f"Memory after GC:  {after_gc:.2f} MB")
+            print(f"Memory freed:     {(before_gc - after_gc):.2f} MB")
+        
+        print("=========== END MEMORY ANALYSIS ============")
+
+    def _get_array_from_pool(self, height, width, channels=4, dtype=None):
+        """Get a numpy array from the pool or create a new one if needed"""
+        import numpy as np
+        
+        # Default to uint8 if not specified
+        if dtype is None:
+            dtype = np.uint8
+            
+        # Create the key for this array size
+        key = (height, width, channels, dtype)
+        
+        # Check if we have an array of this size in the pool
+        if key in self._array_pool and self._array_pool[key]:
+            # Get array from pool
+            array = self._array_pool[key].pop()
+            if self._debug_memory and self._frame_counter % 500 == 0:
+                print(f"Reusing array from pool: {key}")
+                
+            # Mark as in use
+            self._array_in_use[id(array)] = key
+            return array
+        else:
+            # Create a new array
+            array = np.zeros((height, width, channels), dtype=dtype)
+            
+            # Mark as in use
+            self._array_in_use[id(array)] = key
+            
+            if self._debug_memory and self._frame_counter % 500 == 0:
+                print(f"Created new array: {key}")
+            return array
+    
+    def _return_array_to_pool(self, array):
+        """Return a numpy array to the pool for reuse"""
+        if array is None:
+            return
+            
+        # Get the array ID
+        array_id = id(array)
+        
+        # Check if this array is marked as in use
+        if array_id in self._array_in_use:
+            # Get the array dimensions
+            key = self._array_in_use[array_id]
+            
+            # Remove from in-use tracking
+            del self._array_in_use[array_id]
+            
+            # Initialize pool for this size if needed
+            if key not in self._array_pool:
+                self._array_pool[key] = []
+                
+            # Check if we're under the pool size limit
+            if len(self._array_pool[key]) < self._max_array_pool_size:
+                # Zero the array to ensure we're not keeping references to old data
+                array.fill(0)
+                
+                # Add to pool
+                self._array_pool[key].append(array)
+                
+                if self._debug_memory and self._frame_counter % 500 == 0:
+                    print(f"Returned array to pool: {key}")
+            else:
+                # Just let it be garbage collected
+                if self._debug_memory and self._frame_counter % 500 == 0:
+                    print(f"Pool full, releasing array: {key}")
+    
+    def _trim_array_pool(self):
+        """Trim the array pool to remove excess arrays"""
+        # Remove excess arrays from the pool
+        for key, arrays in list(self._array_pool.items()):
+            # Keep only the maximum allowed number of arrays per size
+            while len(arrays) > self._max_array_pool_size:
+                arrays.pop(0)  # Remove the oldest array
+                
+        # Log pool status
+        if self._debug_memory:
+            total_arrays = sum(len(arrays) for arrays in self._array_pool.values())
+            in_use = len(self._array_in_use)
+            print(f"Array pool stats: pooled={total_arrays}, in_use={in_use}")
+    
+    def _cleanup_array_pool(self):
+        """Clear the entire array pool"""
+        self._array_pool.clear()
+        # Don't clear _array_in_use as those arrays are still being referenced
+
+    def _synchronize_pools_with_gc(self):
+        """Synchronize object pools with the garbage collector to prevent leaks"""
+        import gc
+        
+        # Force a garbage collection first to reduce reference counts
+        gc.collect()
+        
+        # Get current reference counts for objects
+        texture_refs = {}
+        array_refs = {}
+        
+        # Check texture references
+        for size, textures in list(self._texture_pool.items()):
+            for texture in textures:
+                texture_id = id(texture)
+                texture_refs[texture_id] = sys.getrefcount(texture) - 3  # Account for this function's refs
+                
+        # Check array references
+        for key, arrays in list(self._array_pool.items()):
+            for array in arrays:
+                array_id = id(array)
+                array_refs[array_id] = sys.getrefcount(array) - 3  # Account for this function's refs
+        
+        # Log any objects with unexpected reference counts
+        problematic_textures = []
+        for texture_id, ref_count in texture_refs.items():
+            if ref_count > 1:  # Should only have one reference (in our pool)
+                problematic_textures.append(texture_id)
+                if self._debug_memory:
+                    print(f"WARNING: Texture {texture_id} has {ref_count} references")
+                
+        problematic_arrays = []
+        for array_id, ref_count in array_refs.items():
+            if ref_count > 1:  # Should only have one reference (in our pool)
+                problematic_arrays.append(array_id)
+                if self._debug_memory:
+                    print(f"WARNING: Array {array_id} has {ref_count} references")
+                
+        if problematic_textures:
+            print(f"WARNING: Found {len(problematic_textures)} textures with multiple references")
+            
+        if problematic_arrays:
+            print(f"WARNING: Found {len(problematic_arrays)} arrays with multiple references")
+        
+        # Immediately clean up problematic textures - don't wait for periodic cleanup
+        if problematic_textures:
+            for size, textures in list(self._texture_pool.items()):
+                # Find and remove problematic textures
+                i = 0
+                while i < len(textures):
+                    if id(textures[i]) in problematic_textures:
+                        # Release this problematic texture
+                        texture = textures.pop(i)
+                        self._safely_release_texture(texture, from_pool=True)
+                        print(f"Removed problematic texture from pool")
+                    else:
+                        i += 1
+            
+        # Clean up problematic arrays
+        if problematic_arrays:
+            for key, arrays in list(self._array_pool.items()):
+                # Find and remove problematic arrays
+                i = 0
+                while i < len(arrays):
+                    if id(arrays[i]) in problematic_arrays:
+                        # Just remove from pool, don't need explicit release for numpy arrays
+                        arrays.pop(i)
+                        print(f"Removed problematic array from pool")
+                    else:
+                        i += 1
+        
+        # If using Metal, do an orphaned texture check
+        if hasattr(self, 'using_metal') and self.using_metal:
+            orphaned = self._clean_orphaned_textures()
+            if orphaned > 0:
+                # Add these to our problem count
+                return len(problematic_textures) + len(problematic_arrays) + orphaned
+        
+        # Every 10 minutes, do a deeper check and cleanup
+        if self._frame_counter % 26400 == 0:  # ~10 minutes at 44fps
+            print("Performing deep pool synchronization...")
+            
+            # Clean up texture pool entries that have problematic reference counts
+            for size, textures in list(self._texture_pool.items()):
+                self._texture_pool[size] = [t for t in textures if id(t) not in problematic_textures]
+                
+            # Clean up array pool entries that have problematic reference counts  
+            for key, arrays in list(self._array_pool.items()):
+                self._array_pool[key] = [a for a in arrays if id(a) not in problematic_arrays]
+        
+        # Return number of problematic objects found
+        return len(problematic_textures) + len(problematic_arrays)
+
+class MainWindow(QMainWindow):
+    """
+    The main application window containing the canvas.
+    """
+    
+    def __init__(self, artnet_listener, config=None):
+        super().__init__()
+        
+        self.setWindowTitle("Art-Net Visualizer")
+        self.config = config or {}
+        self.artnet_listener = artnet_listener
+        
+        # Apply visualization configuration with defaults
+        pixel_size = self.config.get('pixel_size', 1)
+        gap_x = self.config.get('gap_x', 0)
+        gap_y = self.config.get('gap_y', 0)
+        canvas_width = self.config.get('canvas_width', 0)
+        canvas_height = self.config.get('canvas_height', 0)
+        start_x = self.config.get('start_x', 0)
+        start_y = self.config.get('start_y', 0)
+        frame_rate = self.config.get('frame_rate', 44)
+        
+        # Create the central widget and layout - store as instance variables for later use
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+        self.main_layout.setContentsMargins(10, 10, 10, 10)
+        self.main_layout.setSpacing(10)
+        
+        # Create the canvas with Art-Net listener and visualization settings
+        self.canvas = CanvasWidget(
+            artnet_listener,
+            pixel_size=pixel_size,
+            gap_x=gap_x,
+            gap_y=gap_y,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+            start_x=start_x,
+            start_y=start_y
+        )
+        
+        # Apply frame rate from config
+        self.canvas.frame_rate = frame_rate
+        self.canvas.set_frame_rate(frame_rate)
+        
+        # Add the canvas to the main layout
+        self.main_layout.addWidget(self.canvas, 1)  # Give it stretch factor of 1
+        
+        # Create and add control panel
+        self._create_control_panel()
+        
+        # Create menu bar
+        self._create_menus()
+        
+        # Set initial window size (wider than tall to accommodate DMX visualizer)
+        self.resize(900, 400)
+    
+    def _create_control_panel(self):
+        """Create a control panel with visualization settings controls"""
+        # Create the control panel widget and layout
+        self.control_panel = QWidget()
+        control_layout = QVBoxLayout(self.control_panel)  # Change to vertical layout
+        control_layout.setContentsMargins(10, 5, 10, 10)
+        control_layout.setSpacing(8)
+        
+        # Create horizontal layout for all controls
